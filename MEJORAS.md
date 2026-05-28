@@ -12,3 +12,4 @@ En esta actualizacion mejore el sistema POS de Tienda Periquita para que sea mas
 - Agregue compras a proveedores para registrar entradas, actualizar stock, actualizar costos y conservar historial.
 - Agregue al perrito asistente en pixel art para caminar por la pantalla y mostrar mensajes motivacionales al vendedor.
 - Deje fuera de la subida bases de datos locales, ejecutables, ZIPs y carpetas generadas para mantener el repositorio limpio.
+- Agregue documentacion nueva para explicar como usar el ejecutable, la base principal, el respaldo y los assets locales.
