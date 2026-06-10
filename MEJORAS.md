@@ -13,3 +13,6 @@ En esta actualizacion mejore el sistema POS de Tienda Periquita para que sea mas
 - Agregue al perrito asistente en pixel art para caminar por la pantalla y mostrar mensajes motivacionales al vendedor.
 - Deje fuera de la subida bases de datos locales, ejecutables, ZIPs y carpetas generadas para mantener el repositorio limpio.
 - Agregue documentacion nueva para explicar como usar el ejecutable, la base principal, el respaldo y los assets locales.
+- Integre apartados de clientes con anticipos, abonos, devoluciones, liquidacion y registro de venta final.
+- Integre prestamos de productos con descuento de inventario, devolucion al stock o cobro como venta normal.
+- Mejore la mascota para usar frases y animaciones configurables desde `assets/perrito_config.json`.

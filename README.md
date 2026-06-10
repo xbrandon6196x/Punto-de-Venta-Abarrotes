@@ -1,6 +1,6 @@
 # Punto de Venta Abarrotes - Tienda Periquita
 
-Sistema de escritorio para punto de venta, inventario, cortes de caja, compras a proveedores y reportes de ventas para una tienda de abarrotes.
+Sistema de escritorio para punto de venta, inventario, cortes de caja, compras a proveedores, apartados, prestamos y reportes de ventas para una tienda de abarrotes.
 
 ## Como ejecutarlo
 
@@ -43,9 +43,21 @@ contrasena: venta123
 
 Al iniciar como vendedor, el sistema pide el nombre real de quien esta atendiendo caja. Ese nombre se guarda en ventas, cortes y KPIs.
 
+## Modulos principales
+
+- Punto de venta con lector de codigo de barras, busqueda manual y control de stock.
+- Inventario con categorias, precios, historial, stock minimo y movimientos.
+- Ventas del dia con venta, costo, ganancia y vendedor.
+- Corte de caja por vendedor con fondo inicial, efectivo esperado, contado, diferencia y observaciones.
+- Reportes administrativos por rango, vendedor, hora, producto y categoria.
+- Compras a proveedores con entrada de mercancia, costo y precio de venta.
+- Apartados de clientes con anticipos, abonos, devoluciones, liquidacion y venta final.
+- Prestamos de productos con descuento de inventario, devolucion o cobro.
+- Mascota animada con frases configurables desde `assets/perrito_config.json`.
+
 ## Base de datos y respaldo
 
-- `abarrotes_pos.db` guarda inventario, ventas, usuarios, compras, tickets pendientes y cortes.
+- `abarrotes_pos.db` guarda inventario, ventas, usuarios, compras, apartados, prestamos, tickets pendientes y cortes.
 - `abarrotes_pos_respaldo.db` es una copia de respaldo generada por el sistema.
 - Si se va la luz o se cierra el programa por accidente, SQLite usa modo WAL y el ticket pendiente se restaura al volver a entrar con el mismo vendedor.
 

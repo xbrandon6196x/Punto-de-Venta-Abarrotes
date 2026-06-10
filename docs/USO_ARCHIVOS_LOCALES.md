@@ -23,6 +23,9 @@ Esta es la base principal de SQLite. Aqui se guarda:
 - usuarios y sesiones
 - cortes de caja
 - compras a proveedores
+- clientes
+- apartados y abonos
+- prestamos y devoluciones
 - tickets pendientes
 - historial de movimientos
 
@@ -36,9 +39,17 @@ Si necesito recuperar informacion, primero reviso este respaldo antes de iniciar
 
 ## assets/
 
-Esta carpeta guarda los recursos visuales del sistema, incluyendo los cuadros del perrito asistente.
+Esta carpeta guarda los recursos visuales del sistema, incluyendo los cuadros y GIFs del perrito asistente.
+
+Archivos importantes:
+
+- `assets/perrito_config.json`: frases y mapeo de animaciones por evento.
+- `assets/animacion/`: GIFs, WebP y frames por accion.
+- `assets/perrito_frames/`: frames PNG originales de respaldo.
 
 Si se mueve o se borra, el programa sigue funcionando, pero el perrito puede no aparecer.
+
+Puedo cambiar frases sin tocar el codigo editando `assets/perrito_config.json`.
 
 ## Que no debo publicar con datos reales
 
