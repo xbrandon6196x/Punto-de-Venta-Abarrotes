@@ -1,4 +1,4 @@
- #!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════╗
@@ -37,10 +37,17 @@ from PySide6.QtGui import QColor, QMovie, QPixmap, QTransform
 DB_NAME = "abarrotes_pos.db"
 BACKUP_DB_NAME = "abarrotes_pos_respaldo.db"
 CODIGO_MANUAL_PREFIX = "MANUAL-"
-APP_DIR = Path(__file__).resolve().parent
-PERRITO_FRAMES_DIR = APP_DIR / "assets" / "perrito_frames"
+APP_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
+BUNDLED_APP_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR)).resolve()
 PERRITO_ASSETS_DIR = APP_DIR / "assets"
-PERRITO_CONFIG_PATH = APP_DIR / "assets" / "perrito_config.json"
+if not PERRITO_ASSETS_DIR.exists():
+    PERRITO_ASSETS_DIR = BUNDLED_APP_DIR / "assets"
+PERRITO_FRAMES_DIR = PERRITO_ASSETS_DIR / "perrito_frames"
+PERRITO_CONFIG_PATH = PERRITO_ASSETS_DIR / "perrito_config.json"
 MESES_ES = [
     "enero", "febrero", "marzo", "abril", "mayo", "junio",
     "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
