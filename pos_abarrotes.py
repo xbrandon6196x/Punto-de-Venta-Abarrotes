@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
 )
 from PySide6.QtCore import Qt, QDate, QTimer
-from PySide6.QtGui import QColor, QMovie, QPixmap, QTransform
+from PySide6.QtGui import QColor, QImage, QMovie, QPixmap, QTransform
 
 # ──────────────────────────────────────────────────────────
 # CONFIGURACIÓN
@@ -392,6 +392,20 @@ def resumen_caja_sesion(sesion_id, cierre=None):
         """, (sesion_id,))
         anticipos_efectivo, anticipos_otros, devoluciones = c.fetchone()
 
+        # Separar cuánto de lo vendido proviene de cobros de préstamo
+        # (informativo: ya está incluido en los totales por método)
+        c.execute("""
+            SELECT
+                COALESCE(SUM(v.total), 0),
+                COALESCE(SUM(CASE WHEN v.metodo_pago = 'Efectivo'
+                                  THEN v.total ELSE 0 END), 0)
+            FROM ventas v
+            WHERE v.sesion_id = ?
+              AND v.id IN (SELECT venta_id FROM detalle_prestamos
+                           WHERE venta_id IS NOT NULL)
+        """, (sesion_id,))
+        prestamos_cobrados, prestamos_cobrados_efectivo = c.fetchone()
+
     esperado = fondo + efectivo + anticipos_efectivo - devoluciones
     return {
         "usuario_id": usuario_id,
@@ -406,6 +420,8 @@ def resumen_caja_sesion(sesion_id, cierre=None):
         "anticipos_efectivo": anticipos_efectivo,
         "anticipos_otros": anticipos_otros,
         "devoluciones_anticipo": devoluciones,
+        "prestamos_cobrados": prestamos_cobrados,
+        "prestamos_cobrados_efectivo": prestamos_cobrados_efectivo,
         "num_ventas": num_ventas,
         "esperado": esperado,
     }
@@ -634,7 +650,22 @@ def crear_tablas():
                 FOREIGN KEY (prestamo_id) REFERENCES prestamos(id),
                 FOREIGN KEY (producto_id) REFERENCES productos(id)
             );
+            CREATE TABLE IF NOT EXISTS movimientos_cliente (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                cliente_id      INTEGER NOT NULL,
+                tipo_movimiento TEXT NOT NULL,
+                referencia      TEXT DEFAULT '',
+                monto           REAL DEFAULT 0,
+                fecha           TEXT NOT NULL,
+                usuario_id      INTEGER,
+                sesion_id       INTEGER,
+                vendedor_nombre TEXT DEFAULT '',
+                observaciones   TEXT DEFAULT '',
+                FOREIGN KEY (cliente_id) REFERENCES clientes(id),
+                FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
+            );
         """)
+        agregar_columna_si_falta(conn, "detalle_prestamos", "vendedor_nombre", "TEXT DEFAULT ''")
         agregar_columna_si_falta(conn, "detalle_ventas", "costo_unitario", "REAL DEFAULT 0")
         agregar_columna_si_falta(conn, "detalle_ventas", "costo_total", "REAL DEFAULT 0")
         agregar_columna_si_falta(conn, "ventas", "usuario_id", "INTEGER")
@@ -722,6 +753,95 @@ def obtener_o_crear_cliente(cursor, nombre, telefono="", correo="", fecha=None):
         VALUES (?, ?, ?, ?)
     """, (nombre, telefono, correo, fecha))
     return cursor.lastrowid
+
+
+# Etiquetas amigables para el historial de movimientos del cliente
+TIPOS_MOVIMIENTO_CLIENTE = {
+    "APARTADO": "Apartado creado",
+    "ABONO": "Abono recibido",
+    "LIQUIDACION": "Apartado liquidado (venta)",
+    "CANCELACION": "Apartado cancelado",
+    "DEVOLUCION_ANTICIPO": "Devolución de anticipo",
+    "PRESTAMO": "Productos prestados",
+    "DEVOLUCION": "Producto devuelto",
+    "COBRO_PRESTAMO": "Préstamo cobrado (venta)",
+}
+
+
+def registrar_movimiento_cliente(cursor, cliente_id, tipo, referencia, monto,
+                                 fecha, usuario_id=None, sesion_id=None,
+                                 vendedor="", observaciones=""):
+    """Bitácora por cliente: cada préstamo, abono, devolución o cobro queda
+    registrado con fecha y vendedor para el historial rápido."""
+    cursor.execute("""
+        INSERT INTO movimientos_cliente
+            (cliente_id, tipo_movimiento, referencia, monto, fecha,
+             usuario_id, sesion_id, vendedor_nombre, observaciones)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (cliente_id, tipo, referencia, monto, fecha,
+          usuario_id, sesion_id, vendedor, observaciones))
+
+
+def deuda_cliente(cliente_id):
+    """Saldo pendiente del cliente: préstamos sin devolver/cobrar y
+    apartados activos sin liquidar."""
+    with conectar() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT COALESCE(SUM(d.cantidad * d.precio_unitario), 0)
+            FROM detalle_prestamos d
+            JOIN prestamos p ON p.id = d.prestamo_id
+            WHERE p.cliente_id = ? AND d.estado = 'PRESTADO'
+        """, (cliente_id,))
+        prestamos = c.fetchone()[0]
+
+        c.execute("""
+            SELECT COALESCE(SUM(a.monto_total - COALESCE((
+                       SELECT SUM(ab.monto) FROM abonos_apartado ab
+                       WHERE ab.apartado_id = a.id AND ab.tipo = 'ABONO'), 0)), 0)
+            FROM apartados a
+            WHERE a.cliente_id = ? AND a.estado = 'ACTIVO'
+        """, (cliente_id,))
+        apartados = c.fetchone()[0]
+
+    return {
+        "prestamos": prestamos,
+        "apartados": apartados,
+        "total": prestamos + apartados,
+    }
+
+
+def mensaje_error_db(e):
+    """Convierte errores técnicos en mensajes claros para el personal."""
+    texto = str(e)
+    if isinstance(e, sqlite3.OperationalError) and "locked" in texto.lower():
+        return ("La base de datos está ocupada en este momento.\n"
+                "Espera unos segundos y vuelve a intentarlo.")
+    if isinstance(e, sqlite3.IntegrityError):
+        return ("No se pudo guardar: el dato ya existe o hace referencia\n"
+                "a información que fue eliminada. Revisa e intenta de nuevo.")
+    if isinstance(e, ValueError):
+        return texto
+    return f"Ocurrió un error inesperado. Detalle técnico:\n{texto}"
+
+
+def quitar_fondo_blanco(pixmap, umbral=232):
+    """Vuelve transparentes los pixeles casi blancos de una imagen para que
+    el perrito se integre sobre la interfaz. Respeta la transparencia que la
+    imagen ya tenga (solo se tocan pixeles totalmente opacos)."""
+    if pixmap.isNull():
+        return pixmap
+    img = pixmap.toImage().convertToFormat(QImage.Format_ARGB32)
+    for y in range(img.height()):
+        for x in range(img.width()):
+            color = img.pixelColor(x, y)
+            if (color.alpha() == 255
+                    and color.red() >= umbral
+                    and color.green() >= umbral
+                    and color.blue() >= umbral):
+                color.setAlpha(0)
+                img.setPixelColor(x, y, color)
+    return QPixmap.fromImage(img)
 
 
 def separar_fecha_hora(fecha_hora):
@@ -1240,6 +1360,12 @@ class DialogoCierreCaja(QDialog):
         form.addRow("Vendido con tarjeta:", QLabel(f"${resumen['tarjeta']:.2f}"))
         form.addRow("Vendido por transferencia:", QLabel(f"${resumen['transferencia']:.2f}"))
         form.addRow("Vendido otro método:", QLabel(f"${resumen['otro']:.2f}"))
+        lbl_prest = QLabel(
+            f"${resumen.get('prestamos_cobrados', 0):.2f} "
+            f"(${resumen.get('prestamos_cobrados_efectivo', 0):.2f} en efectivo)"
+        )
+        lbl_prest.setToolTip("Ya incluido en los totales por método de pago.")
+        form.addRow("De lo vendido, cobros de préstamo:", lbl_prest)
         form.addRow("Anticipo de apartado (efectivo):",
                     QLabel(f"${resumen.get('anticipos_efectivo', 0):.2f}"))
         form.addRow("Anticipo de apartado (otros métodos):",
@@ -1327,6 +1453,7 @@ class AsistentePerrito(QWidget):
         self._estado = ""
         self._ultima_actividad = datetime.now()
         self._aviso_inactividad = False
+        self._cache_pix = {}   # frames ya escalados y con fondo transparente
 
         self._img = QLabel(self)
         self._img.setFixedSize(self._tam, self._tam)
@@ -1468,18 +1595,33 @@ class AsistentePerrito(QWidget):
     def _frame_gif(self, *_args):
         if self._movie is None:
             return
-        pix = self._movie.currentPixmap()
-        if not pix.isNull():
+        clave = (self._movie.fileName(), self._movie.currentFrameNumber())
+        pix = self._pixmap_procesado(clave, lambda: self._movie.currentPixmap())
+        if pix is not None and not pix.isNull():
             self._mostrar_pixmap(pix)
 
-    def _mostrar_pixmap(self, pix):
-        if self._dx < 0:
-            pix = pix.transformed(QTransform().scale(-1, 1))
+    def _pixmap_procesado(self, clave, obtener_pix):
+        """Escala el frame y le quita el fondo blanco una sola vez (caché)."""
+        pix = self._cache_pix.get(clave)
+        if pix is not None:
+            return pix
+        pix = obtener_pix()
+        if pix is None or pix.isNull():
+            return None
         pix = pix.scaled(
             self._tam, self._tam,
             Qt.KeepAspectRatio,
             Qt.SmoothTransformation,
         )
+        pix = quitar_fondo_blanco(pix)
+        if len(self._cache_pix) > 600:
+            self._cache_pix.clear()
+        self._cache_pix[clave] = pix
+        return pix
+
+    def _mostrar_pixmap(self, pix):
+        if self._dx < 0:
+            pix = pix.transformed(QTransform().scale(-1, 1))
         self._img.setPixmap(pix)
         self._img.move(0, 28)
 
@@ -1488,7 +1630,10 @@ class AsistentePerrito(QWidget):
             if self._movie is None and not self._gifs:
                 self.hide()
             return
-        self._mostrar_pixmap(self._frames[self._frame_idx % len(self._frames)])
+        idx = self._frame_idx % len(self._frames)
+        pix = self._pixmap_procesado(("frames", idx), lambda: self._frames[idx])
+        if pix is not None and not pix.isNull():
+            self._mostrar_pixmap(pix)
 
     def _siguiente_frame(self):
         if self._movie is not None or not self._frames:
@@ -1748,6 +1893,319 @@ class DialogoAbonosApartado(QDialog):
 
 
 # ──────────────────────────────────────────────────────────
+# DIÁLOGOS — CLIENTES (BUSCADOR E HISTORIAL)
+# ──────────────────────────────────────────────────────────
+
+class DialogoBuscarCliente(QDialog):
+    """Buscador de clientes existentes con su deuda a la vista.
+    Al aceptar, `self.cliente` contiene el cliente elegido."""
+
+    def __init__(self, parent=None, titulo="Buscar cliente"):
+        super().__init__(parent)
+        self.setWindowTitle(titulo)
+        self.resize(880, 460)
+        self.cliente = None
+        self._filas = []
+
+        lay = QVBoxLayout(self)
+
+        hl = QHBoxLayout()
+        self._inp_buscar = QLineEdit()
+        self._inp_buscar.setPlaceholderText("🔍  Escribe el nombre o teléfono del cliente...")
+        self._inp_buscar.textChanged.connect(self._cargar)
+        hl.addWidget(self._inp_buscar)
+        lay.addLayout(hl)
+
+        self._tabla = QTableWidget()
+        self._tabla.setColumnCount(8)
+        self._tabla.setHorizontalHeaderLabels([
+            "ID", "Cliente", "Teléfono", "Correo",
+            "Prést. activos", "Debe préstamos", "Apart. activos", "Debe apartados",
+        ])
+        self._tabla.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._tabla.setSelectionBehavior(QTableWidget.SelectRows)
+        self._tabla.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._tabla.setAlternatingRowColors(True)
+        self._tabla.hideColumn(0)
+        self._tabla.doubleClicked.connect(self._seleccionar)
+        lay.addWidget(self._tabla)
+
+        hint = QLabel("💡  Doble clic para seleccionar. Los montos en rojo indican deuda pendiente.")
+        hint.setStyleSheet("color: #6c7086; font-size: 11px;")
+        lay.addWidget(hint)
+
+        hl_btn = QHBoxLayout()
+        btn_sel = QPushButton("✔  Seleccionar cliente")
+        btn_sel.setObjectName("btn_verde")
+        btn_sel.clicked.connect(self._seleccionar)
+
+        btn_hist = QPushButton("📖  Ver historial")
+        btn_hist.clicked.connect(self._ver_historial)
+
+        btn_cancelar = QPushButton("Cancelar")
+        btn_cancelar.clicked.connect(self.reject)
+
+        hl_btn.addWidget(btn_sel)
+        hl_btn.addWidget(btn_hist)
+        hl_btn.addStretch()
+        hl_btn.addWidget(btn_cancelar)
+        lay.addLayout(hl_btn)
+
+        self._cargar()
+        self._inp_buscar.setFocus()
+
+    def _cargar(self, *args):
+        q = self._inp_buscar.text().strip()
+        filtros = ["cl.activo = 1"]
+        params = []
+        if q:
+            like = f"%{q}%"
+            filtros.append("(cl.nombre LIKE ? OR cl.telefono LIKE ?)")
+            params.extend([like, like])
+
+        with conectar() as conn:
+            c = conn.cursor()
+            c.execute(f"""
+                SELECT cl.id, cl.nombre, COALESCE(cl.telefono, ''), COALESCE(cl.correo, ''),
+                       (SELECT COUNT(*) FROM prestamos p
+                        WHERE p.cliente_id = cl.id AND p.estado = 'ACTIVO'),
+                       (SELECT COALESCE(SUM(d.cantidad * d.precio_unitario), 0)
+                        FROM detalle_prestamos d
+                        JOIN prestamos p ON p.id = d.prestamo_id
+                        WHERE p.cliente_id = cl.id AND d.estado = 'PRESTADO'),
+                       (SELECT COUNT(*) FROM apartados a
+                        WHERE a.cliente_id = cl.id AND a.estado = 'ACTIVO'),
+                       (SELECT COALESCE(SUM(a.monto_total - COALESCE((
+                               SELECT SUM(ab.monto) FROM abonos_apartado ab
+                               WHERE ab.apartado_id = a.id AND ab.tipo = 'ABONO'), 0)), 0)
+                        FROM apartados a
+                        WHERE a.cliente_id = cl.id AND a.estado = 'ACTIVO')
+                FROM clientes cl
+                WHERE {' AND '.join(filtros)}
+                ORDER BY cl.nombre COLLATE NOCASE
+                LIMIT 150
+            """, params)
+            self._filas = c.fetchall()
+
+        C_ROJO = QColor("#f38ba8")
+        self._tabla.setRowCount(len(self._filas))
+        for fila, (cid, nombre, tel, correo, pre_act, debe_pre, apa_act, debe_apa) in enumerate(self._filas):
+            valores = [
+                str(cid), nombre, tel, correo,
+                str(pre_act), f"${debe_pre:.2f}",
+                str(apa_act), f"${debe_apa:.2f}",
+            ]
+            for col, val in enumerate(valores):
+                cell = QTableWidgetItem(val)
+                cell.setTextAlignment(Qt.AlignCenter)
+                if (col == 5 and debe_pre > 0) or (col == 7 and debe_apa > 0):
+                    cell.setForeground(C_ROJO)
+                self._tabla.setItem(fila, col, cell)
+
+        if self._filas:
+            self._tabla.selectRow(0)
+
+    def _cliente_fila(self):
+        fila = self._tabla.currentRow()
+        if fila < 0 or fila >= len(self._filas):
+            QMessageBox.information(self, "Sin selección",
+                                    "Selecciona primero un cliente de la lista.")
+            return None
+        cid, nombre, tel, correo, pre_act, debe_pre, apa_act, debe_apa = self._filas[fila]
+        return {
+            "id": cid, "nombre": nombre, "telefono": tel, "correo": correo,
+            "prestamos_activos": pre_act, "debe_prestamos": debe_pre,
+            "apartados_activos": apa_act, "debe_apartados": debe_apa,
+        }
+
+    def _seleccionar(self, *args):
+        cliente = self._cliente_fila()
+        if not cliente:
+            return
+        self.cliente = cliente
+        self.accept()
+
+    def _ver_historial(self):
+        cliente = self._cliente_fila()
+        if not cliente:
+            return
+        DialogoHistorialCliente(cliente["id"], self).exec()
+
+
+class DialogoHistorialCliente(QDialog):
+    """Historial rápido del cliente: préstamos con estados, apartados con
+    abonos, y bitácora de movimientos con el vendedor de cada uno."""
+
+    def __init__(self, cliente_id, parent=None):
+        super().__init__(parent)
+        self._cliente_id = cliente_id
+        self.resize(940, 560)
+        lay = QVBoxLayout(self)
+
+        with conectar() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT nombre, COALESCE(telefono, ''), COALESCE(correo, '')
+                FROM clientes WHERE id = ?
+            """, (cliente_id,))
+            row = c.fetchone()
+        nombre, telefono, correo = row if row else ("Cliente", "", "")
+        self.setWindowTitle(f"Historial del cliente — {nombre}")
+
+        deuda = deuda_cliente(cliente_id)
+        color_deuda = "#f38ba8" if deuda["total"] > 0 else "#a6e3a1"
+        info = QLabel(
+            f"<b>{nombre}</b>"
+            + (f"&nbsp;&nbsp;|&nbsp;&nbsp;Tel: <b>{telefono}</b>" if telefono else "")
+            + (f"&nbsp;&nbsp;|&nbsp;&nbsp;Correo: <b>{correo}</b>" if correo else "")
+            + f"&nbsp;&nbsp;|&nbsp;&nbsp;Debe en préstamos: <b>${deuda['prestamos']:.2f}</b>"
+            + f"&nbsp;&nbsp;|&nbsp;&nbsp;Debe en apartados: <b>${deuda['apartados']:.2f}</b>"
+            + f"&nbsp;&nbsp;|&nbsp;&nbsp;<span style='color:{color_deuda};'>"
+            + f"Deuda total: <b>${deuda['total']:.2f}</b></span>"
+        )
+        info.setWordWrap(True)
+        lay.addWidget(info)
+
+        tabs = QTabWidget()
+
+        # ── Préstamos (artículos con estados y vendedor) ───
+        self._tabla_pre = QTableWidget()
+        self._tabla_pre.setColumnCount(9)
+        self._tabla_pre.setHorizontalHeaderLabels([
+            "Préstamo", "Fecha préstamo", "Producto", "Cant.", "Precio",
+            "Subtotal", "Estado", "Fecha estado", "Vendedor",
+        ])
+        self._configurar_tabla(self._tabla_pre)
+        tabs.addTab(self._tabla_pre, "🤝 Préstamos")
+
+        # ── Apartados y abonos ─────────────────────────────
+        self._tabla_apa = QTableWidget()
+        self._tabla_apa.setColumnCount(5)
+        self._tabla_apa.setHorizontalHeaderLabels([
+            "Fecha", "Concepto", "Monto", "Método", "Vendedor",
+        ])
+        self._configurar_tabla(self._tabla_apa)
+        tabs.addTab(self._tabla_apa, "💵 Apartados y abonos")
+
+        # ── Bitácora de movimientos ────────────────────────
+        self._tabla_mov = QTableWidget()
+        self._tabla_mov.setColumnCount(6)
+        self._tabla_mov.setHorizontalHeaderLabels([
+            "Fecha", "Movimiento", "Referencia", "Monto", "Vendedor", "Detalle",
+        ])
+        self._configurar_tabla(self._tabla_mov)
+        tabs.addTab(self._tabla_mov, "📖 Movimientos")
+
+        lay.addWidget(tabs)
+
+        btn = QPushButton("Cerrar")
+        btn.clicked.connect(self.accept)
+        lay.addWidget(btn, alignment=Qt.AlignRight)
+
+        self._cargar()
+
+    @staticmethod
+    def _configurar_tabla(tabla):
+        tabla.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        tabla.setEditTriggers(QTableWidget.NoEditTriggers)
+        tabla.setAlternatingRowColors(True)
+
+    def _cargar(self):
+        with conectar() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT p.id, p.fecha, pr.nombre, d.cantidad, d.precio_unitario,
+                       d.estado, COALESCE(d.fecha_estado, ''),
+                       COALESCE(NULLIF(d.vendedor_nombre, ''),
+                                NULLIF(p.vendedor_nombre, ''), 'Sin registro')
+                FROM prestamos p
+                JOIN detalle_prestamos d ON d.prestamo_id = p.id
+                JOIN productos pr ON pr.id = d.producto_id
+                WHERE p.cliente_id = ?
+                ORDER BY p.fecha DESC, d.id DESC
+                LIMIT 300
+            """, (self._cliente_id,))
+            prestamos = c.fetchall()
+
+            c.execute("""
+                SELECT fecha, concepto, monto, metodo, vendedor FROM (
+                    SELECT a.fecha_creacion AS fecha,
+                           'Apartado #' || a.id || ' — ' || a.estado ||
+                               CASE WHEN a.descripcion <> ''
+                                    THEN ' (' || a.descripcion || ')' ELSE '' END AS concepto,
+                           a.monto_total AS monto,
+                           '' AS metodo,
+                           COALESCE(NULLIF(a.vendedor_nombre, ''), 'Sin registro') AS vendedor
+                    FROM apartados a
+                    WHERE a.cliente_id = ?
+                    UNION ALL
+                    SELECT ab.fecha,
+                           CASE WHEN ab.tipo = 'ABONO'
+                                THEN 'Abono al apartado #' || ab.apartado_id
+                                ELSE 'Devolución de anticipo #' || ab.apartado_id END,
+                           CASE WHEN ab.tipo = 'ABONO' THEN ab.monto ELSE -ab.monto END,
+                           ab.metodo_pago,
+                           COALESCE(NULLIF(ab.vendedor_nombre, ''), 'Sin registro')
+                    FROM abonos_apartado ab
+                    JOIN apartados a2 ON a2.id = ab.apartado_id
+                    WHERE a2.cliente_id = ?
+                )
+                ORDER BY fecha DESC
+                LIMIT 300
+            """, (self._cliente_id, self._cliente_id))
+            apartados = c.fetchall()
+
+            c.execute("""
+                SELECT fecha, tipo_movimiento, referencia, monto,
+                       COALESCE(NULLIF(vendedor_nombre, ''), 'Sin registro'),
+                       COALESCE(observaciones, '')
+                FROM movimientos_cliente
+                WHERE cliente_id = ?
+                ORDER BY fecha DESC, id DESC
+                LIMIT 300
+            """, (self._cliente_id,))
+            movimientos = c.fetchall()
+
+        colores = {
+            "PRESTADO": QColor("#f9e2af"),
+            "DEVUELTO": QColor("#a6e3a1"),
+            "COBRADO": QColor("#89b4fa"),
+        }
+        self._tabla_pre.setRowCount(len(prestamos))
+        for fila, (pid, fecha, prod, cant, precio, estado, fecha_e, vendedor) in enumerate(prestamos):
+            valores = [
+                f"#{pid}", fecha, prod, str(cant), f"${precio:.2f}",
+                f"${cant * precio:.2f}", estado, fecha_e, vendedor,
+            ]
+            for col, val in enumerate(valores):
+                cell = QTableWidgetItem(val)
+                cell.setTextAlignment(Qt.AlignCenter)
+                if col == 6 and estado in colores:
+                    cell.setForeground(QColor("#1e1e2e"))
+                    cell.setBackground(colores[estado])
+                self._tabla_pre.setItem(fila, col, cell)
+
+        self._tabla_apa.setRowCount(len(apartados))
+        for fila, (fecha, concepto, monto, metodo, vendedor) in enumerate(apartados):
+            monto_txt = f"-${abs(monto):.2f}" if monto < 0 else f"${monto:.2f}"
+            for col, val in enumerate([fecha, concepto, monto_txt, metodo, vendedor]):
+                cell = QTableWidgetItem(val)
+                cell.setTextAlignment(Qt.AlignCenter)
+                if col == 2 and monto < 0:
+                    cell.setForeground(QColor("#f38ba8"))
+                self._tabla_apa.setItem(fila, col, cell)
+
+        self._tabla_mov.setRowCount(len(movimientos))
+        for fila, (fecha, tipo, ref, monto, vendedor, obs) in enumerate(movimientos):
+            tipo_txt = TIPOS_MOVIMIENTO_CLIENTE.get(tipo, tipo)
+            valores = [fecha, tipo_txt, ref, f"${monto:.2f}", vendedor, obs]
+            for col, val in enumerate(valores):
+                cell = QTableWidgetItem(val)
+                cell.setTextAlignment(Qt.AlignCenter)
+                self._tabla_mov.setItem(fila, col, cell)
+
+
+# ──────────────────────────────────────────────────────────
 # DIÁLOGO — DETALLE DE PRÉSTAMO
 # ──────────────────────────────────────────────────────────
 
@@ -1758,6 +2216,7 @@ class DialogoDetallePrestamo(QDialog):
         super().__init__(parent)
         self._prestamo_id = prestamo_id
         self._ctx = contexto       # usuario_id, sesion_id, vendedor
+        self._cliente_id = None
         self.cambios = False
         self.hubo_devolucion = False
         self.hubo_cobro = False
@@ -1771,10 +2230,10 @@ class DialogoDetallePrestamo(QDialog):
         lay.addWidget(self._lbl_info)
 
         self._tabla = QTableWidget()
-        self._tabla.setColumnCount(8)
+        self._tabla.setColumnCount(9)
         self._tabla.setHorizontalHeaderLabels([
             "ID", "Producto", "Código", "Cant.", "Precio Unit.",
-            "Subtotal", "Estado", "Fecha estado",
+            "Subtotal", "Estado", "Fecha estado", "Vendedor",
         ])
         self._tabla.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self._tabla.setSelectionBehavior(QTableWidget.SelectRows)
@@ -1825,7 +2284,8 @@ class DialogoDetallePrestamo(QDialog):
             c = conn.cursor()
             c.execute("""
                 SELECT cl.nombre, COALESCE(cl.telefono, ''), p.fecha, p.estado,
-                       COALESCE(NULLIF(p.vendedor_nombre, ''), 'Sin registro')
+                       COALESCE(NULLIF(p.vendedor_nombre, ''), 'Sin registro'),
+                       p.cliente_id
                 FROM prestamos p
                 JOIN clientes cl ON cl.id = p.cliente_id
                 WHERE p.id = ?
@@ -1834,7 +2294,8 @@ class DialogoDetallePrestamo(QDialog):
 
             c.execute("""
                 SELECT d.id, pr.nombre, pr.codigo_barras, d.cantidad,
-                       d.precio_unitario, d.estado, COALESCE(d.fecha_estado, '')
+                       d.precio_unitario, d.estado, COALESCE(d.fecha_estado, ''),
+                       COALESCE(NULLIF(d.vendedor_nombre, ''), '')
                 FROM detalle_prestamos d
                 JOIN productos pr ON pr.id = d.producto_id
                 WHERE d.prestamo_id = ?
@@ -1843,11 +2304,15 @@ class DialogoDetallePrestamo(QDialog):
             filas = c.fetchall()
 
         if cab:
-            nombre, telefono, fecha, estado, vendedor = cab
+            nombre, telefono, fecha, estado, vendedor, cliente_id = cab
+            self._cliente_id = cliente_id
             tel_txt = f"&nbsp;&nbsp;|&nbsp;&nbsp;Tel: <b>{telefono}</b>" if telefono else ""
             pendiente = sum(
-                cant * precio for _d, _n, _c, cant, precio, est, _f in filas
+                cant * precio for _d, _n, _c, cant, precio, est, _f, _v in filas
                 if est == "PRESTADO"
+            )
+            total_prestado = sum(
+                cant * precio for _d, _n, _c, cant, precio, _e, _f, _v in filas
             )
             self._lbl_info.setText(
                 f"<b>Préstamo #{self._prestamo_id}</b>&nbsp;&nbsp;|&nbsp;&nbsp;"
@@ -1855,6 +2320,7 @@ class DialogoDetallePrestamo(QDialog):
                 f"Fecha: {fecha}&nbsp;&nbsp;|&nbsp;&nbsp;"
                 f"Estado: <b>{estado}</b>&nbsp;&nbsp;|&nbsp;&nbsp;"
                 f"Vendedor: <b>{vendedor}</b>&nbsp;&nbsp;|&nbsp;&nbsp;"
+                f"Valor total: <b>${total_prestado:.2f}</b>&nbsp;&nbsp;|&nbsp;&nbsp;"
                 f"Pendiente: <b>${pendiente:.2f}</b>"
             )
 
@@ -1864,10 +2330,11 @@ class DialogoDetallePrestamo(QDialog):
             "COBRADO": QColor("#89b4fa"),
         }
         self._tabla.setRowCount(len(filas))
-        for fila, (did, nombre, codigo, cant, precio, estado, fecha_e) in enumerate(filas):
+        for fila, (did, nombre, codigo, cant, precio, estado, fecha_e, vend_item) in enumerate(filas):
             valores = [
                 str(did), nombre, codigo_visible(codigo), str(cant),
                 f"${precio:.2f}", f"${cant * precio:.2f}", estado, fecha_e,
+                vend_item or "Sin registro",
             ]
             for col, val in enumerate(valores):
                 cell = QTableWidgetItem(val)
@@ -1936,9 +2403,9 @@ class DialogoDetallePrestamo(QDialog):
             c = conn.cursor()
             c.execute("""
                 UPDATE detalle_prestamos
-                SET estado = 'DEVUELTO', fecha_estado = ?
+                SET estado = 'DEVUELTO', fecha_estado = ?, vendedor_nombre = ?
                 WHERE id = ? AND estado = 'PRESTADO'
-            """, (fecha, did))
+            """, (fecha, self._ctx["vendedor"], did))
             c.execute("UPDATE productos SET stock = stock + ? WHERE id = ?",
                       (cantidad, producto_id))
             c.execute("""
@@ -1947,6 +2414,16 @@ class DialogoDetallePrestamo(QDialog):
                 VALUES (?, 'ENTRADA', ?, ?, ?)
             """, (producto_id, cantidad,
                   f"Devolución préstamo #{self._prestamo_id}", fecha))
+            c.execute("SELECT nombre FROM productos WHERE id = ?", (producto_id,))
+            fila_nombre = c.fetchone()
+            nombre_prod = fila_nombre[0] if fila_nombre else "producto"
+            if self._cliente_id:
+                registrar_movimiento_cliente(
+                    c, self._cliente_id, "DEVOLUCION",
+                    f"Préstamo #{self._prestamo_id}", cantidad * _precio, fecha,
+                    self._ctx["usuario_id"], self._ctx["sesion_id"],
+                    self._ctx["vendedor"], f"{nombre_prod} x{cantidad}",
+                )
             self._actualizar_estado_prestamo(c)
 
         asegurar_base_guardada()
@@ -2007,10 +2484,19 @@ class DialogoDetallePrestamo(QDialog):
                 # El stock ya se descontó al prestar; aquí solo cambia el estado.
                 c.execute("""
                     UPDATE detalle_prestamos
-                    SET estado = 'COBRADO', fecha_estado = ?, venta_id = ?
+                    SET estado = 'COBRADO', fecha_estado = ?, venta_id = ?,
+                        vendedor_nombre = ?
                     WHERE id = ?
-                """, (fecha, vid, did))
+                """, (fecha, vid, self._ctx["vendedor"], did))
 
+            if self._cliente_id:
+                registrar_movimiento_cliente(
+                    c, self._cliente_id, "COBRO_PRESTAMO",
+                    f"Venta #{vid}", total, fecha,
+                    self._ctx["usuario_id"], self._ctx["sesion_id"],
+                    self._ctx["vendedor"],
+                    f"{len(items)} artículo(s) del préstamo #{self._prestamo_id} ({metodo})",
+                )
             self._actualizar_estado_prestamo(c)
 
         asegurar_base_guardada()
@@ -2134,6 +2620,42 @@ class POSAbarrotes(QMainWindow):
     def _perrito_evento(self, evento):
         if hasattr(self, "_perrito") and self._perrito:
             self._perrito.evento(evento)
+
+    # ── helpers de clientes (compartidos por ventas, apartados y préstamos) ──
+
+    def _abrir_buscador_clientes(self, titulo="Buscar cliente"):
+        dlg = DialogoBuscarCliente(self, titulo)
+        if dlg.exec() == QDialog.Accepted and dlg.cliente:
+            return dlg.cliente
+        return None
+
+    def _texto_deuda_cliente(self, cliente):
+        deuda = deuda_cliente(cliente["id"])
+        if deuda["total"] > 0:
+            partes = []
+            if deuda["prestamos"] > 0:
+                partes.append(f"préstamos ${deuda['prestamos']:.2f}")
+            if deuda["apartados"] > 0:
+                partes.append(f"apartados ${deuda['apartados']:.2f}")
+            return (f"⚠  «{cliente['nombre']}» tiene saldo pendiente: "
+                    f"{' y '.join(partes)}.")
+        return f"✓  «{cliente['nombre']}» no tiene deuda pendiente."
+
+    def _avisar_deuda_cliente(self, cliente, etiqueta=None):
+        texto = self._texto_deuda_cliente(cliente)
+        if etiqueta is not None:
+            color = "#f9e2af" if texto.startswith("⚠") else "#a6e3a1"
+            etiqueta.setStyleSheet(f"color: {color}; font-size: 12px;")
+            etiqueta.setText(texto)
+        self._statusbar.showMessage(texto, 8000)
+
+    def _consultar_cliente_pos(self):
+        cliente = self._abrir_buscador_clientes("Consultar cliente")
+        if not cliente:
+            return
+        self._avisar_deuda_cliente(cliente)
+        DialogoHistorialCliente(cliente["id"], self).exec()
+        self._enfocar_codigo_venta()
 
     def _guardar_ticket_pendiente(self):
         if not hasattr(self, "_usuario_actual"):
@@ -2384,6 +2906,7 @@ class POSAbarrotes(QMainWindow):
             ("➖  − Cantidad",      "",          self._restar_cantidad),
             ("🗑   Eliminar fila",  "btn_rojo",  self._eliminar_item),
             ("❌  Cancelar venta",  "btn_rojo",  self._cancelar_venta),
+            ("👤  Consultar cliente", "",        self._consultar_cliente_pos),
         ]
         for texto, obj, slot in acciones:
             b = QPushButton(texto)
@@ -2818,7 +3341,8 @@ class POSAbarrotes(QMainWindow):
 
         except Exception as e:
             QMessageBox.critical(self, "Error al cobrar",
-                                 f"No se pudo registrar la venta:\n{e}")
+                                 "No se pudo registrar la venta.\n\n"
+                                 + mensaje_error_db(e))
             self._enfocar_codigo_venta()
 
     # ══════════════════════════════════════════════════════
@@ -3777,13 +4301,26 @@ class POSAbarrotes(QMainWindow):
         btn_registrar.setObjectName("btn_verde")
         btn_registrar.clicked.connect(self._registrar_apartado)
 
+        self._apartado_cliente_id = None
+        btn_cliente_apa = QPushButton("👤  Cliente existente")
+        btn_cliente_apa.clicked.connect(self._seleccionar_cliente_apartado)
+
+        self._lbl_aviso_apa = QLabel("")
+        self._lbl_aviso_apa.setStyleSheet("color: #a6adc8; font-size: 12px;")
+
+        # Si el vendedor edita los datos a mano, ya no es el cliente elegido
+        for campo in (self._inp_apa_nombre, self._inp_apa_tel):
+            campo.textEdited.connect(self._reiniciar_cliente_apartado)
+
         grid.addWidget(QLabel("Cliente *:"),        0, 0); grid.addWidget(self._inp_apa_nombre,    0, 1)
         grid.addWidget(QLabel("Teléfono:"),         0, 2); grid.addWidget(self._inp_apa_tel,       0, 3)
         grid.addWidget(QLabel("Correo:"),           0, 4); grid.addWidget(self._inp_apa_correo,    0, 5)
+        grid.addWidget(btn_cliente_apa,             0, 6)
         grid.addWidget(QLabel("Producto apartado:"),1, 0); grid.addWidget(self._inp_apa_desc,      1, 1)
         grid.addWidget(QLabel("Monto total *:"),    1, 2); grid.addWidget(self._spin_apa_monto,    1, 3)
         grid.addWidget(QLabel("Anticipo inicial *:"),1, 4); grid.addWidget(self._spin_apa_anticipo, 1, 5)
         grid.addWidget(QLabel("Método:"),           2, 0); grid.addWidget(self._combo_apa_metodo,  2, 1)
+        grid.addWidget(self._lbl_aviso_apa,         2, 2, 1, 3)
         grid.addWidget(btn_registrar,               2, 5)
         root.addWidget(grp)
 
@@ -3807,6 +4344,9 @@ class POSAbarrotes(QMainWindow):
         btn_abonos = QPushButton("📜  Ver abonos")
         btn_abonos.clicked.connect(self._ver_abonos_apartado)
 
+        btn_hist_apa = QPushButton("📖  Historial cliente")
+        btn_hist_apa.clicked.connect(self._historial_cliente_apartado)
+
         btn_liquidar = QPushButton("✅  Liquidar (convertir en venta)")
         btn_liquidar.setObjectName("btn_naranja")
         btn_liquidar.clicked.connect(self._liquidar_apartado)
@@ -3818,6 +4358,7 @@ class POSAbarrotes(QMainWindow):
 
         hl.addWidget(btn_abonar)
         hl.addWidget(btn_abonos)
+        hl.addWidget(btn_hist_apa)
         hl.addWidget(btn_liquidar)
         hl.addWidget(self._btn_cancelar_apa)
         hl.addStretch()
@@ -3866,6 +4407,40 @@ class POSAbarrotes(QMainWindow):
             return False
         return True
 
+    def _seleccionar_cliente_apartado(self):
+        cliente = self._abrir_buscador_clientes("Seleccionar cliente para apartado")
+        if not cliente:
+            return
+        self._apartado_cliente_id = cliente["id"]
+        self._inp_apa_nombre.setText(cliente["nombre"])
+        self._inp_apa_tel.setText(cliente["telefono"])
+        self._inp_apa_correo.setText(cliente["correo"])
+        self._avisar_deuda_cliente(cliente, self._lbl_aviso_apa)
+
+    def _reiniciar_cliente_apartado(self, *args):
+        self._apartado_cliente_id = None
+        if hasattr(self, "_lbl_aviso_apa"):
+            self._lbl_aviso_apa.setText("")
+
+    def _cliente_id_para_registro(self, cursor, cliente_seleccionado,
+                                  nombre, telefono, correo, fecha):
+        """Reutiliza el cliente elegido en el buscador si sigue vigente;
+        si no, busca/crea por nombre y teléfono."""
+        if cliente_seleccionado:
+            cursor.execute("SELECT id FROM clientes WHERE id = ? AND activo = 1",
+                           (cliente_seleccionado,))
+            if cursor.fetchone():
+                return cliente_seleccionado
+        return obtener_o_crear_cliente(cursor, nombre, telefono, correo, fecha)
+
+    def _historial_cliente_apartado(self):
+        apartado_id = self._apartado_seleccionado()
+        if not apartado_id:
+            return
+        datos = self._datos_apartado(apartado_id)
+        if datos:
+            DialogoHistorialCliente(datos["cliente_id"], self).exec()
+
     def _registrar_apartado(self):
         nombre = self._inp_apa_nombre.text()
         telefono = self._inp_apa_tel.text().strip()
@@ -3894,7 +4469,9 @@ class POSAbarrotes(QMainWindow):
         try:
             with conectar() as conn:
                 c = conn.cursor()
-                cliente_id = obtener_o_crear_cliente(c, nombre, telefono, correo, fecha)
+                cliente_id = self._cliente_id_para_registro(
+                    c, self._apartado_cliente_id, nombre, telefono, correo, fecha
+                )
                 c.execute("""
                     INSERT INTO apartados
                         (cliente_id, descripcion, monto_total, estado, fecha_creacion,
@@ -3914,9 +4491,20 @@ class POSAbarrotes(QMainWindow):
                     apartado_id, anticipo, metodo, fecha,
                     self._usuario_actual["id"], self._sesion_id, self._nombre_operador,
                 ))
+                registrar_movimiento_cliente(
+                    c, cliente_id, "APARTADO", f"Apartado #{apartado_id}",
+                    monto, fecha, self._usuario_actual["id"], self._sesion_id,
+                    self._nombre_operador, descripcion,
+                )
+                registrar_movimiento_cliente(
+                    c, cliente_id, "ABONO", f"Apartado #{apartado_id}",
+                    anticipo, fecha, self._usuario_actual["id"], self._sesion_id,
+                    self._nombre_operador, f"Anticipo inicial ({metodo})",
+                )
         except Exception as e:
             QMessageBox.critical(self, "Error al guardar",
-                                 f"No se pudo registrar el apartado:\n{e}")
+                                 "No se pudo registrar el apartado.\n\n"
+                                 + mensaje_error_db(e))
             return
 
         asegurar_base_guardada()
@@ -3925,6 +4513,7 @@ class POSAbarrotes(QMainWindow):
             campo.clear()
         self._spin_apa_monto.setValue(0)
         self._spin_apa_anticipo.setValue(0)
+        self._reiniciar_cliente_apartado()
         self._cargar_apartados()
         self._perrito_evento("apartado")
         QMessageBox.information(
@@ -4008,21 +4597,23 @@ class POSAbarrotes(QMainWindow):
             c = conn.cursor()
             c.execute("""
                 SELECT a.id, cl.nombre, a.descripcion, a.monto_total, a.estado,
-                       COALESCE(SUM(CASE WHEN ab.tipo = 'ABONO' THEN ab.monto ELSE 0 END), 0)
+                       COALESCE(SUM(CASE WHEN ab.tipo = 'ABONO' THEN ab.monto ELSE 0 END), 0),
+                       a.cliente_id
                 FROM apartados a
                 JOIN clientes cl ON cl.id = a.cliente_id
                 LEFT JOIN abonos_apartado ab ON ab.apartado_id = a.id
                 WHERE a.id = ?
-                GROUP BY a.id, cl.nombre, a.descripcion, a.monto_total, a.estado
+                GROUP BY a.id, cl.nombre, a.descripcion, a.monto_total, a.estado,
+                         a.cliente_id
             """, (apartado_id,))
             row = c.fetchone()
         if not row:
             return None
-        aid, cliente, desc, monto, estado, abonado = row
+        aid, cliente, desc, monto, estado, abonado, cliente_id = row
         return {
             "id": aid, "cliente": cliente, "descripcion": desc,
             "monto": monto, "estado": estado, "abonado": abonado,
-            "saldo": monto - abonado,
+            "saldo": monto - abonado, "cliente_id": cliente_id,
         }
 
     def _abonar_apartado(self):
@@ -4055,7 +4646,8 @@ class POSAbarrotes(QMainWindow):
 
         fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with conectar() as conn:
-            conn.execute("""
+            c = conn.cursor()
+            c.execute("""
                 INSERT INTO abonos_apartado
                     (apartado_id, tipo, monto, metodo_pago, fecha,
                      usuario_id, sesion_id, vendedor_nombre)
@@ -4064,6 +4656,11 @@ class POSAbarrotes(QMainWindow):
                 apartado_id, r["monto"], r["metodo"], fecha,
                 self._usuario_actual["id"], self._sesion_id, self._nombre_operador,
             ))
+            registrar_movimiento_cliente(
+                c, datos["cliente_id"], "ABONO", f"Apartado #{apartado_id}",
+                r["monto"], fecha, self._usuario_actual["id"], self._sesion_id,
+                self._nombre_operador, f"Abono ({r['metodo']})",
+            )
 
         asegurar_base_guardada()
         self._cargar_apartados()
@@ -4129,9 +4726,23 @@ class POSAbarrotes(QMainWindow):
                     SET estado = 'LIQUIDADO', fecha_cierre = ?, venta_id = ?
                     WHERE id = ? AND estado = 'ACTIVO'
                 """, (fecha, vid, apartado_id))
+
+                if datos["saldo"] > 0:
+                    registrar_movimiento_cliente(
+                        c, datos["cliente_id"], "ABONO", f"Apartado #{apartado_id}",
+                        datos["saldo"], fecha, self._usuario_actual["id"],
+                        self._sesion_id, self._nombre_operador,
+                        f"Pago final al liquidar ({dlg.metodo()})",
+                    )
+                registrar_movimiento_cliente(
+                    c, datos["cliente_id"], "LIQUIDACION", f"Venta #{vid}",
+                    datos["monto"], fecha, self._usuario_actual["id"],
+                    self._sesion_id, self._nombre_operador, datos["descripcion"],
+                )
         except Exception as e:
             QMessageBox.critical(self, "Error al liquidar",
-                                 f"No se pudo liquidar el apartado:\n{e}")
+                                 "No se pudo liquidar el apartado.\n\n"
+                                 + mensaje_error_db(e))
             return
 
         asegurar_base_guardada()
@@ -4188,6 +4799,19 @@ class POSAbarrotes(QMainWindow):
                 WHERE id = ? AND estado = 'ACTIVO'
             """, (fecha, r["motivo"], apartado_id))
 
+            registrar_movimiento_cliente(
+                c, datos["cliente_id"], "CANCELACION", f"Apartado #{apartado_id}",
+                datos["monto"], fecha, self._usuario_actual["id"],
+                self._sesion_id, self._nombre_operador, r["motivo"],
+            )
+            if r["devolver"] and datos["abonado"] > 0:
+                registrar_movimiento_cliente(
+                    c, datos["cliente_id"], "DEVOLUCION_ANTICIPO",
+                    f"Apartado #{apartado_id}", datos["abonado"], fecha,
+                    self._usuario_actual["id"], self._sesion_id,
+                    self._nombre_operador, "Devolución en efectivo",
+                )
+
         asegurar_base_guardada()
         self._cargar_apartados()
         self._cargar_kpis()
@@ -4237,15 +4861,29 @@ class POSAbarrotes(QMainWindow):
 
         grp_cliente = QGroupBox("Datos del cliente")
         grid_cl = QGridLayout(grp_cliente)
+        self._prestamo_cliente_id = None
         self._inp_pre_nombre = QLineEdit()
         self._inp_pre_nombre.setPlaceholderText("Nombre del cliente *")
         self._inp_pre_tel = QLineEdit()
         self._inp_pre_tel.setPlaceholderText("Teléfono (opcional)")
         self._inp_pre_correo = QLineEdit()
         self._inp_pre_correo.setPlaceholderText("Correo (opcional)")
+
+        btn_buscar_cli = QPushButton("👤  Buscar cliente")
+        btn_buscar_cli.clicked.connect(self._seleccionar_cliente_prestamo)
+
+        self._lbl_aviso_pre = QLabel("")
+        self._lbl_aviso_pre.setStyleSheet("color: #a6adc8; font-size: 12px;")
+
+        # Si el vendedor edita los datos a mano, ya no es el cliente elegido
+        for campo in (self._inp_pre_nombre, self._inp_pre_tel):
+            campo.textEdited.connect(self._reiniciar_cliente_prestamo)
+
         grid_cl.addWidget(QLabel("Cliente *:"), 0, 0); grid_cl.addWidget(self._inp_pre_nombre, 0, 1)
         grid_cl.addWidget(QLabel("Teléfono:"),  0, 2); grid_cl.addWidget(self._inp_pre_tel,    0, 3)
         grid_cl.addWidget(QLabel("Correo:"),    0, 4); grid_cl.addWidget(self._inp_pre_correo, 0, 5)
+        grid_cl.addWidget(btn_buscar_cli,       0, 6)
+        grid_cl.addWidget(self._lbl_aviso_pre,  1, 0, 1, 7)
         izq.addWidget(grp_cliente)
 
         grp_scan = QGroupBox("Escanear / buscar por código de barras")
@@ -4319,11 +4957,21 @@ class POSAbarrotes(QMainWindow):
         self._lbl_total_prestamo.setStyleSheet(
             "font-size: 18px; font-weight: bold; color: #a6e3a1;"
         )
-        btn_registrar = QPushButton("🤝  Registrar préstamo")
+        btn_anadir = QPushButton("➕  Añadir a préstamo existente")
+        btn_anadir.setObjectName("btn_naranja")
+        btn_anadir.setToolTip(
+            "Agrega los productos capturados al préstamo activo "
+            "seleccionado en el control de préstamos."
+        )
+        btn_anadir.clicked.connect(self._anadir_a_prestamo_existente)
+
+        btn_registrar = QPushButton("🤝  Crear nuevo préstamo")
         btn_registrar.setObjectName("btn_verde")
         btn_registrar.clicked.connect(self._registrar_prestamo)
+
         hl_total.addWidget(self._lbl_total_prestamo)
         hl_total.addStretch()
+        hl_total.addWidget(btn_anadir)
         hl_total.addWidget(btn_registrar)
         izq.addLayout(hl_total)
 
@@ -4345,8 +4993,16 @@ class POSAbarrotes(QMainWindow):
         self._combo_estado_pre.addItem("Cerrados", "CERRADO")
         self._combo_estado_pre.addItem("Todos", "")
         self._combo_estado_pre.currentIndexChanged.connect(self._cargar_prestamos)
+
+        btn_ver_activos = QPushButton("👤  Ver préstamos activos")
+        btn_ver_activos.setToolTip(
+            "Busca un cliente y muestra solo sus préstamos activos."
+        )
+        btn_ver_activos.clicked.connect(self._ver_prestamos_activos_cliente)
+
         hl_filtros.addWidget(self._inp_buscar_pre, stretch=2)
         hl_filtros.addWidget(self._combo_estado_pre, stretch=1)
+        hl_filtros.addWidget(btn_ver_activos)
         vl_lista.addLayout(hl_filtros)
 
         self._tabla_prestamos = QTableWidget()
@@ -4362,10 +5018,17 @@ class POSAbarrotes(QMainWindow):
         self._tabla_prestamos.doubleClicked.connect(self._ver_detalle_prestamo)
         vl_lista.addWidget(self._tabla_prestamos)
 
-        btn_detalle = QPushButton("📋  Ver detalle / devolver / cobrar")
+        hl_acciones_pre = QHBoxLayout()
+        btn_detalle = QPushButton("📋  Registrar devolución / convertir a venta")
         btn_detalle.setObjectName("btn_naranja")
         btn_detalle.clicked.connect(self._ver_detalle_prestamo)
-        vl_lista.addWidget(btn_detalle)
+
+        btn_hist_pre = QPushButton("📖  Historial del cliente")
+        btn_hist_pre.clicked.connect(self._historial_cliente_prestamo)
+
+        hl_acciones_pre.addWidget(btn_detalle)
+        hl_acciones_pre.addWidget(btn_hist_pre)
+        vl_lista.addLayout(hl_acciones_pre)
 
         hint = QLabel(
             "💡  Doble clic en un préstamo para devolver productos al inventario "
@@ -4564,7 +5227,185 @@ class POSAbarrotes(QMainWindow):
         self._prestamo_lineas.clear()
         for campo in (self._inp_pre_nombre, self._inp_pre_tel, self._inp_pre_correo):
             campo.clear()
+        self._reiniciar_cliente_prestamo()
         self._refrescar_lineas_prestamo()
+
+    def _seleccionar_cliente_prestamo(self):
+        cliente = self._abrir_buscador_clientes("Seleccionar cliente para préstamo")
+        if not cliente:
+            return
+        self._prestamo_cliente_id = cliente["id"]
+        self._inp_pre_nombre.setText(cliente["nombre"])
+        self._inp_pre_tel.setText(cliente["telefono"])
+        self._inp_pre_correo.setText(cliente["correo"])
+        self._avisar_deuda_cliente(cliente, self._lbl_aviso_pre)
+        # Mostrar de inmediato sus préstamos activos en el control
+        self._combo_estado_pre.setCurrentIndex(0)
+        self._inp_buscar_pre.setText(cliente["nombre"])
+
+    def _reiniciar_cliente_prestamo(self, *args):
+        self._prestamo_cliente_id = None
+        if hasattr(self, "_lbl_aviso_pre"):
+            self._lbl_aviso_pre.setText("")
+
+    def _ver_prestamos_activos_cliente(self):
+        cliente = self._abrir_buscador_clientes("Ver préstamos activos del cliente")
+        if not cliente:
+            return
+        self._combo_estado_pre.setCurrentIndex(0)
+        self._inp_buscar_pre.setText(cliente["nombre"])
+        self._avisar_deuda_cliente(cliente)
+
+    def _prestamo_seleccionado_control(self):
+        fila = self._tabla_prestamos.currentRow()
+        if fila < 0:
+            return None
+        item = self._tabla_prestamos.item(fila, 0)
+        return int(item.text()) if item else None
+
+    def _historial_cliente_prestamo(self):
+        prestamo_id = self._prestamo_seleccionado_control()
+        if prestamo_id:
+            with conectar() as conn:
+                c = conn.cursor()
+                c.execute("SELECT cliente_id FROM prestamos WHERE id = ?",
+                          (prestamo_id,))
+                row = c.fetchone()
+            if row:
+                DialogoHistorialCliente(row[0], self).exec()
+                return
+        # Sin préstamo seleccionado: elegir cliente desde el buscador
+        cliente = self._abrir_buscador_clientes("Historial del cliente")
+        if cliente:
+            DialogoHistorialCliente(cliente["id"], self).exec()
+
+    def _anadir_a_prestamo_existente(self):
+        if not self._prestamo_lineas:
+            QMessageBox.warning(
+                self, "Sin productos",
+                "Primero escanea o agrega los productos que se van a prestar."
+            )
+            return
+
+        prestamo_id = self._prestamo_seleccionado_control()
+        if not prestamo_id:
+            QMessageBox.information(
+                self, "Sin préstamo seleccionado",
+                "Selecciona en el control de préstamos el préstamo activo\n"
+                "al que quieres añadir los productos."
+            )
+            return
+
+        with conectar() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT p.estado, p.cliente_id, cl.nombre
+                FROM prestamos p
+                JOIN clientes cl ON cl.id = p.cliente_id
+                WHERE p.id = ?
+            """, (prestamo_id,))
+            row = c.fetchone()
+
+        if not row:
+            QMessageBox.warning(self, "Préstamo no encontrado",
+                                "No se pudo leer el préstamo seleccionado.")
+            return
+        estado, cliente_id, cliente_nombre = row
+        if estado != "ACTIVO":
+            QMessageBox.warning(
+                self, "Préstamo cerrado",
+                "Ese préstamo ya está cerrado.\n"
+                "Usa «Crear nuevo préstamo» para registrar otro al mismo cliente."
+            )
+            return
+
+        total = sum(i["sub"] for i in self._prestamo_lineas)
+        r = QMessageBox.question(
+            self, "Añadir a préstamo existente",
+            f"Se añadirán {len(self._prestamo_lineas)} producto(s) con valor de "
+            f"${total:.2f} al préstamo #{prestamo_id} de «{cliente_nombre}».\n\n"
+            f"El stock se descontará del inventario hasta su devolución o cobro.\n"
+            f"¿Continuar?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if r != QMessageBox.Yes:
+            return
+
+        fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with conectar() as conn:
+                c = conn.cursor()
+                resumen = self._insertar_lineas_prestamo(c, prestamo_id, fecha)
+                c.execute("UPDATE prestamos SET estado = 'ACTIVO' WHERE id = ?",
+                          (prestamo_id,))
+                registrar_movimiento_cliente(
+                    c, cliente_id, "PRESTAMO", f"Préstamo #{prestamo_id}",
+                    total, fecha, self._usuario_actual["id"], self._sesion_id,
+                    self._nombre_operador, f"Ampliación: {resumen}",
+                )
+        except Exception as e:
+            QMessageBox.critical(self, "Error al añadir",
+                                 "No se pudo añadir al préstamo.\n\n"
+                                 + mensaje_error_db(e))
+            return
+
+        asegurar_base_guardada()
+        self._prestamo_lineas.clear()
+        self._refrescar_lineas_prestamo()
+        self._cargar_prestamos()
+        self._cargar_productos()
+        self._cargar_productos_pos()
+        self._cargar_productos_prestamo()
+        self._perrito_evento("prestamo")
+        QMessageBox.information(
+            self, "Productos añadidos",
+            f"Se añadieron productos por ${total:.2f} al préstamo "
+            f"#{prestamo_id} de «{cliente_nombre}»."
+        )
+
+    def _insertar_lineas_prestamo(self, c, prestamo_id, fecha):
+        """Valida stock, inserta las líneas capturadas en el préstamo dado,
+        descuenta inventario y regresa un resumen de lo prestado."""
+        for item in self._prestamo_lineas:
+            c.execute("""
+                SELECT nombre, stock, activo, precio_compra
+                FROM productos WHERE id = ?
+            """, (item["pid"],))
+            row = c.fetchone()
+            if not row or row[2] != 1:
+                raise ValueError(f"«{item['nombre']}» ya no está activo.")
+            nombre_actual, stock_actual, _activo, costo_actual = row
+            if stock_actual < item["cant"]:
+                raise ValueError(
+                    f"Stock insuficiente para «{nombre_actual}». "
+                    f"Disponible: {stock_actual}, en préstamo: {item['cant']}."
+                )
+            item["costo"] = costo_actual
+
+        for item in self._prestamo_lineas:
+            c.execute("""
+                INSERT INTO detalle_prestamos
+                    (prestamo_id, producto_id, cantidad, precio_unitario,
+                     costo_unitario, estado, fecha_estado, vendedor_nombre)
+                VALUES (?, ?, ?, ?, ?, 'PRESTADO', ?, ?)
+            """, (
+                prestamo_id, item["pid"], item["cant"], item["precio"],
+                item.get("costo", 0) or 0, fecha, self._nombre_operador,
+            ))
+            c.execute(
+                "UPDATE productos SET stock = stock - ? WHERE id = ?",
+                (item["cant"], item["pid"])
+            )
+            c.execute("""
+                INSERT INTO movimientos_inventario
+                    (producto_id, tipo_movimiento, cantidad, motivo, fecha)
+                VALUES (?, 'SALIDA', ?, ?, ?)
+            """, (item["pid"], item["cant"],
+                  f"Préstamo #{prestamo_id}", fecha))
+
+        return ", ".join(
+            f"{i['nombre']} x{i['cant']}" for i in self._prestamo_lineas
+        )
 
     def _registrar_prestamo(self):
         nombre = self._inp_pre_nombre.text()
@@ -4594,23 +5435,9 @@ class POSAbarrotes(QMainWindow):
         try:
             with conectar() as conn:
                 c = conn.cursor()
-                for item in self._prestamo_lineas:
-                    c.execute("""
-                        SELECT nombre, stock, activo, precio_compra
-                        FROM productos WHERE id = ?
-                    """, (item["pid"],))
-                    row = c.fetchone()
-                    if not row or row[2] != 1:
-                        raise ValueError(f"«{item['nombre']}» ya no está activo.")
-                    nombre_actual, stock_actual, _activo, costo_actual = row
-                    if stock_actual < item["cant"]:
-                        raise ValueError(
-                            f"Stock insuficiente para «{nombre_actual}». "
-                            f"Disponible: {stock_actual}, en préstamo: {item['cant']}."
-                        )
-                    item["costo"] = costo_actual
-
-                cliente_id = obtener_o_crear_cliente(c, nombre, telefono, correo, fecha)
+                cliente_id = self._cliente_id_para_registro(
+                    c, self._prestamo_cliente_id, nombre, telefono, correo, fecha
+                )
                 c.execute("""
                     INSERT INTO prestamos
                         (cliente_id, fecha, estado, usuario_id, sesion_id, vendedor_nombre)
@@ -4621,29 +5448,16 @@ class POSAbarrotes(QMainWindow):
                 ))
                 prestamo_id = c.lastrowid
 
-                for item in self._prestamo_lineas:
-                    c.execute("""
-                        INSERT INTO detalle_prestamos
-                            (prestamo_id, producto_id, cantidad, precio_unitario,
-                             costo_unitario, estado, fecha_estado)
-                        VALUES (?, ?, ?, ?, ?, 'PRESTADO', ?)
-                    """, (
-                        prestamo_id, item["pid"], item["cant"], item["precio"],
-                        item.get("costo", 0) or 0, fecha,
-                    ))
-                    c.execute(
-                        "UPDATE productos SET stock = stock - ? WHERE id = ?",
-                        (item["cant"], item["pid"])
-                    )
-                    c.execute("""
-                        INSERT INTO movimientos_inventario
-                            (producto_id, tipo_movimiento, cantidad, motivo, fecha)
-                        VALUES (?, 'SALIDA', ?, ?, ?)
-                    """, (item["pid"], item["cant"],
-                          f"Préstamo #{prestamo_id}", fecha))
+                resumen = self._insertar_lineas_prestamo(c, prestamo_id, fecha)
+                registrar_movimiento_cliente(
+                    c, cliente_id, "PRESTAMO", f"Préstamo #{prestamo_id}",
+                    total, fecha, self._usuario_actual["id"], self._sesion_id,
+                    self._nombre_operador, resumen,
+                )
         except Exception as e:
             QMessageBox.critical(self, "Error al registrar",
-                                 f"No se pudo registrar el préstamo:\n{e}")
+                                 "No se pudo registrar el préstamo.\n\n"
+                                 + mensaje_error_db(e))
             return
 
         asegurar_base_guardada()
@@ -5430,6 +6244,23 @@ class POSAbarrotes(QMainWindow):
         self._tabla_rep_categorias = self._crear_tabla_simple([
             "Categoría", "Cantidad", "Venta", "Costo", "Ganancia", "Margen"
         ])
+        self._tabla_rep_vendedor_full = self._crear_tabla_simple([
+            "Vendedor", "Ventas", "Total", "Ganancia", "Préstamos",
+            "Devoluciones", "Apartados", "Abonos", "Dif. corte"
+        ])
+        self._tabla_rep_clientes = self._crear_tabla_simple([
+            "Cliente", "Teléfono", "Comprado", "Abonos", "Deuda actual",
+            "Prést. activos", "Apart. activos"
+        ])
+        self._tabla_rep_cortes = self._crear_tabla_simple([
+            "Vendedor", "Inicio", "Fin", "Fondo", "Efectivo", "Tarjeta",
+            "Transfer.", "Otro", "Anticipos", "Esperado", "Contado",
+            "Diferencia", "Observaciones"
+        ])
+        self._tabla_rep_prestamos_pend = self._crear_tabla_simple([
+            "Préstamo", "Fecha", "Cliente", "Teléfono", "Art. pendientes",
+            "Valor pendiente", "Vendedor"
+        ])
 
         self._tabs_reportes_fuertes.addTab(self._tabla_top_vendidos, "Top vendidos")
         self._tabs_reportes_fuertes.addTab(self._tabla_top_ganancia, "Más ganancia")
@@ -5437,6 +6268,10 @@ class POSAbarrotes(QMainWindow):
         self._tabs_reportes_fuertes.addTab(self._tabla_rep_horas, "Ventas por hora")
         self._tabs_reportes_fuertes.addTab(self._tabla_rep_vendedores, "Ventas por vendedor")
         self._tabs_reportes_fuertes.addTab(self._tabla_rep_categorias, "Ganancia por categoría")
+        self._tabs_reportes_fuertes.addTab(self._tabla_rep_vendedor_full, "Vendedores (completo)")
+        self._tabs_reportes_fuertes.addTab(self._tabla_rep_clientes, "Clientes")
+        self._tabs_reportes_fuertes.addTab(self._tabla_rep_cortes, "Cortes de caja")
+        self._tabs_reportes_fuertes.addTab(self._tabla_rep_prestamos_pend, "Préstamos pendientes")
         root.addWidget(self._tabs_reportes_fuertes)
 
         return w
@@ -5582,6 +6417,158 @@ class POSAbarrotes(QMainWindow):
             """, (desde, hasta))
             por_categoria = c.fetchall()
 
+            # ── Reporte completo por vendedor ──────────────
+            expr_vend = "COALESCE(NULLIF(vendedor_nombre, ''), 'Sin registro')"
+            c.execute(f"""
+                SELECT {expr_vend}, COUNT(*)
+                FROM prestamos
+                WHERE fecha >= ? AND fecha <= ?
+                GROUP BY {expr_vend}
+            """, (desde, hasta))
+            prestamos_vend = dict(c.fetchall())
+
+            c.execute("""
+                SELECT COALESCE(NULLIF(d.vendedor_nombre, ''),
+                                NULLIF(p.vendedor_nombre, ''), 'Sin registro'),
+                       COUNT(*)
+                FROM detalle_prestamos d
+                JOIN prestamos p ON p.id = d.prestamo_id
+                WHERE d.estado = 'DEVUELTO'
+                  AND d.fecha_estado >= ? AND d.fecha_estado <= ?
+                GROUP BY 1
+            """, (desde, hasta))
+            devoluciones_vend = dict(c.fetchall())
+
+            c.execute(f"""
+                SELECT {expr_vend}, COUNT(*)
+                FROM apartados
+                WHERE fecha_creacion >= ? AND fecha_creacion <= ?
+                GROUP BY {expr_vend}
+            """, (desde, hasta))
+            apartados_vend = dict(c.fetchall())
+
+            c.execute(f"""
+                SELECT {expr_vend}, COALESCE(SUM(monto), 0)
+                FROM abonos_apartado
+                WHERE tipo = 'ABONO' AND fecha >= ? AND fecha <= ?
+                GROUP BY {expr_vend}
+            """, (desde, hasta))
+            abonos_vend = dict(c.fetchall())
+
+            c.execute("""
+                SELECT COALESCE(NULLIF(s.vendedor_nombre, ''), u.nombre, 'Sin registro'),
+                       COALESCE(SUM(COALESCE(s.diferencia_efectivo, 0)), 0)
+                FROM sesiones_usuario s
+                JOIN usuarios u ON u.id = s.usuario_id
+                WHERE s.inicio >= ? AND s.inicio <= ?
+                GROUP BY 1
+            """, (desde, hasta))
+            diferencias_vend = dict(c.fetchall())
+
+            # ── Reporte por cliente ────────────────────────
+            c.execute("""
+                SELECT cl.nombre, COALESCE(cl.telefono, ''),
+                       COALESCE((SELECT SUM(v.total) FROM ventas v
+                                 WHERE v.fecha >= ? AND v.fecha <= ?
+                                   AND (v.id IN (SELECT venta_id FROM apartados
+                                                 WHERE cliente_id = cl.id
+                                                   AND venta_id IS NOT NULL)
+                                        OR v.id IN (SELECT dp.venta_id
+                                                    FROM detalle_prestamos dp
+                                                    JOIN prestamos pp ON pp.id = dp.prestamo_id
+                                                    WHERE pp.cliente_id = cl.id
+                                                      AND dp.venta_id IS NOT NULL))), 0) AS comprado,
+                       COALESCE((SELECT SUM(ab.monto) FROM abonos_apartado ab
+                                 JOIN apartados a2 ON a2.id = ab.apartado_id
+                                 WHERE a2.cliente_id = cl.id AND ab.tipo = 'ABONO'
+                                   AND ab.fecha >= ? AND ab.fecha <= ?), 0) AS abonos,
+                       COALESCE((SELECT SUM(d.cantidad * d.precio_unitario)
+                                 FROM detalle_prestamos d
+                                 JOIN prestamos p ON p.id = d.prestamo_id
+                                 WHERE p.cliente_id = cl.id
+                                   AND d.estado = 'PRESTADO'), 0)
+                       + COALESCE((SELECT SUM(a.monto_total - COALESCE((
+                                       SELECT SUM(ab2.monto) FROM abonos_apartado ab2
+                                       WHERE ab2.apartado_id = a.id
+                                         AND ab2.tipo = 'ABONO'), 0))
+                                   FROM apartados a
+                                   WHERE a.cliente_id = cl.id
+                                     AND a.estado = 'ACTIVO'), 0) AS deuda,
+                       (SELECT COUNT(*) FROM prestamos p2
+                        WHERE p2.cliente_id = cl.id AND p2.estado = 'ACTIVO'),
+                       (SELECT COUNT(*) FROM apartados a3
+                        WHERE a3.cliente_id = cl.id AND a3.estado = 'ACTIVO')
+                FROM clientes cl
+                WHERE cl.activo = 1
+                ORDER BY comprado + abonos DESC, cl.nombre COLLATE NOCASE
+                LIMIT 150
+            """, (desde, hasta, desde, hasta))
+            por_cliente = c.fetchall()
+
+            # ── Cortes de caja del rango ───────────────────
+            ahora_txt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            c.execute("""
+                SELECT COALESCE(NULLIF(s.vendedor_nombre, ''), u.nombre, 'Sin registro'),
+                       s.inicio, COALESCE(s.fin, ''),
+                       COALESCE(s.fondo_inicial, 0),
+                       COALESCE(SUM(CASE WHEN v.metodo_pago = 'Efectivo' THEN v.total ELSE 0 END), 0),
+                       COALESCE(SUM(CASE WHEN v.metodo_pago = 'Tarjeta' THEN v.total ELSE 0 END), 0),
+                       COALESCE(SUM(CASE WHEN v.metodo_pago = 'Transferencia' THEN v.total ELSE 0 END), 0),
+                       COALESCE(SUM(CASE WHEN v.metodo_pago = 'Otro' THEN v.total ELSE 0 END), 0),
+                       COALESCE(aa.anticipos_efectivo, 0),
+                       COALESCE(s.efectivo_contado, 0),
+                       COALESCE(s.diferencia_efectivo, 0),
+                       COALESCE(s.observaciones, ''),
+                       s.estado
+                FROM sesiones_usuario s
+                JOIN usuarios u ON u.id = s.usuario_id
+                LEFT JOIN (
+                    SELECT sesion_id,
+                           SUM(CASE WHEN tipo = 'ABONO' AND metodo_pago = 'Efectivo'
+                                    THEN monto
+                                    WHEN tipo = 'DEVOLUCION' THEN -monto
+                                    ELSE 0 END) AS anticipos_efectivo
+                    FROM abonos_apartado
+                    WHERE sesion_id IS NOT NULL
+                    GROUP BY sesion_id
+                ) aa ON aa.sesion_id = s.id
+                LEFT JOIN ventas v
+                    ON v.sesion_id = s.id
+                    OR (
+                        v.sesion_id IS NULL
+                        AND v.usuario_id = s.usuario_id
+                        AND v.fecha >= s.inicio
+                        AND v.fecha <= COALESCE(s.fin, ?)
+                    )
+                WHERE s.inicio >= ? AND s.inicio <= ?
+                GROUP BY s.id, u.nombre, s.vendedor_nombre, s.inicio, s.fin,
+                         s.fondo_inicial, aa.anticipos_efectivo,
+                         s.efectivo_contado, s.diferencia_efectivo,
+                         s.observaciones, s.estado
+                ORDER BY s.inicio DESC
+                LIMIT 200
+            """, (ahora_txt, desde, hasta))
+            cortes_rango = c.fetchall()
+
+            # ── Préstamos pendientes (estado actual) ───────
+            c.execute("""
+                SELECT p.id, p.fecha, cl.nombre, COALESCE(cl.telefono, ''),
+                       COALESCE(SUM(CASE WHEN d.estado = 'PRESTADO'
+                                         THEN d.cantidad ELSE 0 END), 0),
+                       COALESCE(SUM(CASE WHEN d.estado = 'PRESTADO'
+                                         THEN d.cantidad * d.precio_unitario
+                                         ELSE 0 END), 0),
+                       COALESCE(NULLIF(p.vendedor_nombre, ''), 'Sin registro')
+                FROM prestamos p
+                JOIN clientes cl ON cl.id = p.cliente_id
+                LEFT JOIN detalle_prestamos d ON d.prestamo_id = p.id
+                WHERE p.estado = 'ACTIVO'
+                GROUP BY p.id, p.fecha, cl.nombre, cl.telefono, p.vendedor_nombre
+                ORDER BY p.fecha ASC
+                LIMIT 200
+            """)
+            prestamos_pendientes = c.fetchall()
+
         self._set_tabla(self._tabla_top_vendidos, [
             [n, cat, cant, f"${venta:.2f}", f"${ganancia:.2f}"]
             for n, cat, cant, venta, ganancia in top_vendidos
@@ -5609,6 +6596,65 @@ class POSAbarrotes(QMainWindow):
                 f"{((venta - costo) / venta * 100) if venta else 0:.1f}%",
             ]
             for cat, cant, venta, costo in por_categoria
+        ])
+
+        # Vendedores (completo): unir ventas con préstamos, apartados y cortes
+        datos_vendedor = {
+            vend: {"ventas": ventas, "total": venta, "ganancia": ganancia}
+            for vend, ventas, venta, ganancia, _prom in por_vendedor
+        }
+        todos_vendedores = (
+            set(datos_vendedor) | set(prestamos_vend) | set(devoluciones_vend)
+            | set(apartados_vend) | set(abonos_vend) | set(diferencias_vend)
+        )
+        filas_vend_full = []
+        for vend in sorted(todos_vendedores,
+                           key=lambda v: datos_vendedor.get(v, {}).get("total", 0),
+                           reverse=True):
+            base = datos_vendedor.get(vend, {})
+            filas_vend_full.append([
+                vend,
+                base.get("ventas", 0),
+                f"${base.get('total', 0):.2f}",
+                f"${base.get('ganancia', 0):.2f}",
+                prestamos_vend.get(vend, 0),
+                devoluciones_vend.get(vend, 0),
+                apartados_vend.get(vend, 0),
+                f"${abonos_vend.get(vend, 0):.2f}",
+                f"${diferencias_vend.get(vend, 0):.2f}",
+            ])
+        self._set_tabla(self._tabla_rep_vendedor_full, filas_vend_full)
+
+        self._set_tabla(self._tabla_rep_clientes, [
+            [
+                nombre, tel, f"${comprado:.2f}", f"${abonos:.2f}",
+                f"${deuda:.2f}", pre_act, apa_act,
+            ]
+            for nombre, tel, comprado, abonos, deuda, pre_act, apa_act in por_cliente
+        ])
+
+        filas_cortes = []
+        for (vend, inicio, fin, fondo, efectivo, tarjeta, transfer, otro,
+             anticipos, contado, diferencia, observaciones, estado) in cortes_rango:
+            fecha_ini, hora_ini = separar_fecha_hora(inicio)
+            _f, hora_fin = separar_fecha_hora(fin) if fin else ("", "")
+            esperado = fondo + efectivo + anticipos
+            filas_cortes.append([
+                vend, f"{fecha_ini} {hora_ini}", hora_fin or estado,
+                f"${fondo:.2f}", f"${efectivo:.2f}", f"${tarjeta:.2f}",
+                f"${transfer:.2f}", f"${otro:.2f}", f"${anticipos:.2f}",
+                f"${esperado:.2f}", f"${contado:.2f}", f"${diferencia:.2f}",
+                observaciones,
+            ])
+        self._set_tabla(self._tabla_rep_cortes, filas_cortes)
+
+        self._set_tabla(self._tabla_rep_prestamos_pend, [
+            [
+                f"#{pid}", separar_fecha_hora(fecha)[0], cliente, tel,
+                pendientes, f"${valor:.2f}", vendedor,
+            ]
+            for pid, fecha, cliente, tel, pendientes, valor, vendedor
+            in prestamos_pendientes
         ])
 
     # ══════════════════════════════════════════════════════
