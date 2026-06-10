@@ -1,5 +1,13 @@
 {
   "_ayuda": "Edita este archivo para cambiar las frases y animaciones del perrito sin tocar el código. En 'frases' cada evento tiene su lista de mensajes ({nombre} se sustituye por el vendedor). En 'animaciones' se asocia cada evento/estado con el nombre de un GIF (sin .gif) que esté dentro de la carpeta assets/ o sus subcarpetas. Si un GIF no existe, el perrito usa la animación de caminar o sus frames originales.",
+  "modo_animaciones": "aleatorio",
+  "animaciones_aleatorias": [
+    "caminando",
+    "saludando",
+    "saltando",
+    "girando_360",
+    "idle_parado"
+  ],
   "frases": {
     "login": [
       "¡Buen día, {nombre}!",

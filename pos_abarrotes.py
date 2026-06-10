@@ -1311,6 +1311,9 @@ class AsistentePerrito(QWidget):
         self._gifs = self._cargar_gifs()
         self._frases = {k: list(v) for k, v in FRASES_PERRITO.items()}
         self._animaciones = dict(ANIMACIONES_PERRITO)
+        self._modo_animaciones = "aleatorio"
+        self._animaciones_aleatorias = []
+        self._ultimo_gif = ""
         self._aplicar_config_externa()
 
         self._tam = 82
@@ -1381,22 +1384,63 @@ class AsistentePerrito(QWidget):
             if not PERRITO_CONFIG_PATH.exists():
                 return
             datos = json.loads(PERRITO_CONFIG_PATH.read_text(encoding="utf-8"))
+            modo = str(datos.get("modo_animaciones", self._modo_animaciones)).strip().lower()
+            if modo in ("aleatorio", "random"):
+                self._modo_animaciones = "aleatorio"
+            elif modo in ("por_evento", "evento"):
+                self._modo_animaciones = "por_evento"
+
+            animaciones_aleatorias = datos.get("animaciones_aleatorias")
+            if isinstance(animaciones_aleatorias, list):
+                self._animaciones_aleatorias = [
+                    Path(str(gif)).stem.lower()
+                    for gif in animaciones_aleatorias
+                    if str(gif).strip()
+                ]
+
             for evento, frases in (datos.get("frases") or {}).items():
                 if isinstance(frases, list) and frases:
                     self._frases[evento] = [str(f) for f in frases]
             for estado, gif in (datos.get("animaciones") or {}).items():
                 if gif:
-                    self._animaciones[estado] = str(gif)
+                    self._animaciones[estado] = Path(str(gif)).stem.lower()
         except (OSError, ValueError):
             pass
 
     # ── animaciones ────────────────────────────────────────
 
-    def _set_estado(self, estado, duracion_ms=0):
+    def _nombres_animacion_aleatoria(self):
+        candidatos = [
+            nombre for nombre in self._animaciones_aleatorias
+            if nombre in self._gifs
+        ]
+        if not candidatos:
+            candidatos = sorted(self._gifs.keys())
+        return candidatos
+
+    def _ruta_animacion_aleatoria(self):
+        candidatos = self._nombres_animacion_aleatoria()
+        if not candidatos:
+            return None
+        opciones = [nombre for nombre in candidatos if nombre != self._ultimo_gif]
+        elegido = random.choice(opciones or candidatos)
+        self._ultimo_gif = elegido
+        return self._gifs.get(elegido)
+
+    def _ruta_animacion_por_evento(self, estado):
         nombre_gif = (self._animaciones.get(estado) or "").lower()
         ruta = self._gifs.get(nombre_gif)
         if ruta is None and estado != "caminando":
             ruta = self._gifs.get((self._animaciones.get("caminando") or "").lower())
+        if ruta is not None:
+            self._ultimo_gif = ruta.stem.lower()
+        return ruta
+
+    def _set_estado(self, estado, duracion_ms=0):
+        if self._modo_animaciones == "aleatorio":
+            ruta = self._ruta_animacion_aleatoria()
+        else:
+            ruta = self._ruta_animacion_por_evento(estado)
 
         if self._movie is not None:
             self._movie.stop()
@@ -1486,6 +1530,7 @@ class AsistentePerrito(QWidget):
         frase = self._frase("casual")
         if frase:
             self.mostrar_mensaje(frase)
+        self._set_estado("casual", 4500)
 
     def evento(self, nombre):
         """Reacciona a un evento del sistema: frase contextual + animación."""
