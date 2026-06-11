@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QSpinBox, QDoubleSpinBox, QHeaderView,
     QComboBox, QGroupBox, QDialog, QFormLayout,
     QStatusBar, QDateEdit, QGridLayout, QDialogButtonBox,
-    QPlainTextEdit,
+    QPlainTextEdit, QScrollArea, QFrame,
 )
 from PySide6.QtCore import Qt, QDate, QTimer
 from PySide6.QtGui import QColor, QImage, QMovie, QPixmap, QTransform
@@ -825,22 +825,58 @@ def mensaje_error_db(e):
     return f"Ocurrió un error inesperado. Detalle técnico:\n{texto}"
 
 
-def quitar_fondo_blanco(pixmap, umbral=232):
-    """Vuelve transparentes los pixeles casi blancos de una imagen para que
-    el perrito se integre sobre la interfaz. Respeta la transparencia que la
-    imagen ya tenga (solo se tocan pixeles totalmente opacos)."""
+def quitar_fondo_blanco(pixmap, umbral=235):
+    """Vuelve transparente SOLO el fondo claro conectado con el borde de la
+    imagen (relleno desde las orillas). Así el fondo blanco desaparece pero
+    el pelaje blanco del perrito, que está rodeado por su contorno, se
+    conserva intacto. Si la imagen ya trae transparencia propia (como los
+    .webp del perrito), se respeta tal cual y no se toca ningún pixel."""
     if pixmap.isNull():
         return pixmap
     img = pixmap.toImage().convertToFormat(QImage.Format_ARGB32)
-    for y in range(img.height()):
-        for x in range(img.width()):
-            color = img.pixelColor(x, y)
-            if (color.alpha() == 255
-                    and color.red() >= umbral
-                    and color.green() >= umbral
-                    and color.blue() >= umbral):
-                color.setAlpha(0)
-                img.setPixelColor(x, y, color)
+    w, h = img.width(), img.height()
+    if w == 0 or h == 0:
+        return pixmap
+
+    # Si el asset ya tiene pixeles transparentes, viene bien hecho: respetarlo.
+    for y in range(h):
+        for x in range(w):
+            if img.pixelColor(x, y).alpha() < 250:
+                return QPixmap.fromImage(img)
+
+    def es_fondo(color):
+        return (color.red() >= umbral
+                and color.green() >= umbral
+                and color.blue() >= umbral)
+
+    # Relleno (flood fill) iniciando en todas las orillas de la imagen
+    visitado = bytearray(w * h)
+    pila = []
+    for x in range(w):
+        pila.append((x, 0))
+        pila.append((x, h - 1))
+    for y in range(h):
+        pila.append((0, y))
+        pila.append((w - 1, y))
+
+    while pila:
+        x, y = pila.pop()
+        if x < 0 or y < 0 or x >= w or y >= h:
+            continue
+        i = y * w + x
+        if visitado[i]:
+            continue
+        visitado[i] = 1
+        color = img.pixelColor(x, y)
+        if not es_fondo(color):
+            continue
+        color.setAlpha(0)
+        img.setPixelColor(x, y, color)
+        pila.append((x + 1, y))
+        pila.append((x - 1, y))
+        pila.append((x, y + 1))
+        pila.append((x, y - 1))
+
     return QPixmap.fromImage(img)
 
 
@@ -1495,12 +1531,15 @@ class AsistentePerrito(QWidget):
     # ── carga de recursos y configuración ──────────────────
 
     def _cargar_gifs(self):
-        """Detecta todos los GIFs dentro de assets/ (subcarpetas incluidas)."""
+        """Detecta las animaciones dentro de assets/ (subcarpetas incluidas).
+        Si existe un .webp con el mismo nombre que un .gif se prefiere el
+        .webp, porque trae transparencia real y el perrito se ve sin fondo."""
         gifs = {}
         try:
             if PERRITO_ASSETS_DIR.exists():
-                for ruta in sorted(PERRITO_ASSETS_DIR.rglob("*.gif")):
-                    gifs.setdefault(ruta.stem.lower(), ruta)
+                for patron in ("*.gif", "*.webp"):
+                    for ruta in sorted(PERRITO_ASSETS_DIR.rglob(patron)):
+                        gifs[ruta.stem.lower()] = ruta
         except OSError:
             pass
         return gifs
@@ -1646,7 +1685,7 @@ class AsistentePerrito(QWidget):
         if not parent:
             return
         max_x = max(0, parent.width() - self.width() - 20)
-        target_y = max(80, parent.height() - self.height() - 58)
+        target_y = max(80, parent.height() - self.height() - 36)
         self._y = int(self._y + (target_y - self._y) * 0.18)
         self._x += self._dx
         if self._x <= 10 or self._x >= max_x:
@@ -4842,9 +4881,16 @@ class POSAbarrotes(QMainWindow):
 
     def _crear_tab_prestamos(self):
         w = QWidget()
-        self._tab_prestamos_widget = w
         root = QVBoxLayout(w)
-        root.setSpacing(8)
+        root.setSpacing(6)
+        # Vista más compacta solo en esta pestaña (mismos colores y estilo)
+        w.setStyleSheet("""
+            QGroupBox { font-size: 12px; margin-top: 10px; }
+            QPushButton { padding: 5px 10px; min-height: 26px; font-size: 12px; }
+            QLineEdit, QComboBox { min-height: 24px; font-size: 12px; padding: 3px 6px; }
+            QTableWidget { font-size: 12px; }
+            QHeaderView::section { padding: 4px 4px; font-size: 12px; }
+        """)
 
         self._prestamo_lineas = []
 
@@ -4853,11 +4899,11 @@ class POSAbarrotes(QMainWindow):
         root.addWidget(lbl)
 
         cuerpo = QHBoxLayout()
-        cuerpo.setSpacing(12)
+        cuerpo.setSpacing(10)
 
         # ── Columna izquierda: préstamo nuevo ──────────────
         izq = QVBoxLayout()
-        izq.setSpacing(8)
+        izq.setSpacing(6)
 
         grp_cliente = QGroupBox("Datos del cliente")
         grid_cl = QGridLayout(grp_cliente)
@@ -4935,6 +4981,7 @@ class POSAbarrotes(QMainWindow):
         self._tabla_lineas_prestamo.setSelectionBehavior(QTableWidget.SelectRows)
         self._tabla_lineas_prestamo.setEditTriggers(QTableWidget.NoEditTriggers)
         self._tabla_lineas_prestamo.setAlternatingRowColors(True)
+        self._tabla_lineas_prestamo.setMinimumHeight(120)
         izq.addWidget(self._tabla_lineas_prestamo)
 
         grp_acc = QGroupBox("Acciones del préstamo")
@@ -4979,7 +5026,7 @@ class POSAbarrotes(QMainWindow):
 
         # ── Columna derecha: préstamos registrados ─────────
         der = QVBoxLayout()
-        der.setSpacing(8)
+        der.setSpacing(6)
 
         grp_lista = QGroupBox("Control de préstamos")
         vl_lista = QVBoxLayout(grp_lista)
@@ -5008,14 +5055,16 @@ class POSAbarrotes(QMainWindow):
         self._tabla_prestamos = QTableWidget()
         self._tabla_prestamos.setColumnCount(8)
         self._tabla_prestamos.setHorizontalHeaderLabels([
-            "ID", "Fecha", "Cliente", "Teléfono",
-            "Artículos", "Pendiente", "Estado", "Vendedor",
+            "ID", "Fecha", "Cliente", "Tel.",
+            "Arts.", "Debe", "Estado", "Vendedor",
         ])
         self._tabla_prestamos.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self._tabla_prestamos.setSelectionBehavior(QTableWidget.SelectRows)
         self._tabla_prestamos.setEditTriggers(QTableWidget.NoEditTriggers)
         self._tabla_prestamos.setAlternatingRowColors(True)
         self._tabla_prestamos.doubleClicked.connect(self._ver_detalle_prestamo)
+        self._tabla_prestamos.setMinimumHeight(220)
+        self._tabla_prestamos.hideColumn(0)
         vl_lista.addWidget(self._tabla_prestamos)
 
         hl_acciones_pre = QHBoxLayout()
@@ -5042,7 +5091,15 @@ class POSAbarrotes(QMainWindow):
         cuerpo.addLayout(der, stretch=2)
         root.addLayout(cuerpo)
 
-        return w
+        # Área con desplazamiento: en ventanas pequeñas aparece una barra en
+        # lugar de encimarse o cortarse los botones.
+        w.setMinimumWidth(1100)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(w)
+        self._tab_prestamos_widget = scroll
+        return scroll
 
     # ── helpers de préstamos ───────────────────────────────
 
