@@ -6,7 +6,7 @@
 
 Las contraseñas del personal quedarán guardadas de forma segura (con sal,
 imposibles de adivinar aunque alguien vea la base de datos o el código en
-GitHub). Quien entre con una clave por defecto (admin123, venta123…)
+GitHub). Quien entre con una clave por defecto histórica
 tendrá que elegir una nueva antes de poder usar la caja. Cada usuario
 podrá cambiar su propia contraseña desde la app, y el administrador podrá
 asignarle una nueva a cualquier usuario si la olvida. La pantalla de
@@ -67,7 +67,7 @@ Verificables uno a uno. El verificador los revisará contra el diff real.
 - [ ] Un usuario con hash SHA-256 viejo (BD de tienda real) puede entrar
       con su misma contraseña, y tras ese login su hash queda en formato
       `pbkdf2$...` sin que él haga nada.
-- [ ] Al entrar con una clave por defecto (p. ej. admin/admin123) la app
+- [ ] Al entrar con una clave por defecto histórica la app
       OFRECE elegir contraseña nueva; si el usuario acepta, la nueva no
       puede ser vacía ni otra clave por defecto; si dice que no, entra
       normalmente con su clave de siempre (actualizado 2026-07-10).

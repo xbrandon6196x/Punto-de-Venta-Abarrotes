@@ -32,10 +32,12 @@ def test_verificar_password_acepta_hash_legado():
 
 def test_codigo_sin_claves_quemadas():
     """El repo es público: ninguna clave histórica puede vivir en el
-    fuente. Las cuentas se crean en el primer arranque (DialogoPrimerUsuario)."""
+    fuente NI en este test (por eso se guardan invertidas). Las cuentas
+    se crean en el primer arranque (DialogoPrimerUsuario)."""
     fuente = Path(pos.__file__).read_text(encoding="utf-8")
-    for clave in ("admin123", "venta123", "venta456", "venta789"):
-        assert clave not in fuente
+    claves_invertidas = ("321nimda", "321atnev", "654atnev", "987atnev")
+    for invertida in claves_invertidas:
+        assert invertida[::-1] not in fuente
 
 
 # ── Primer arranque y usuarios ──────────────────────────────────────

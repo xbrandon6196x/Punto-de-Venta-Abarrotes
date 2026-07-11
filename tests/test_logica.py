@@ -13,8 +13,8 @@ AHORA = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def test_hash_password_es_determinista_y_distingue():
-    assert pos.hash_password("admin123") == pos.hash_password("admin123")
-    assert pos.hash_password("admin123") != pos.hash_password("otra")
+    assert pos.hash_password("clave-cualquiera") == pos.hash_password("clave-cualquiera")
+    assert pos.hash_password("clave-cualquiera") != pos.hash_password("otra")
 
 
 def test_codigos_manuales():

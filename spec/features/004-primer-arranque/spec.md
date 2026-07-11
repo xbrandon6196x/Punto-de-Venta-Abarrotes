@@ -14,10 +14,11 @@ usuarios y claves viven en su base de datos y siguen entrando igual.
 
 ## Por qué
 
-El repositorio es público y las claves por defecto (`admin123`,
-`venta123`…) estaban escritas en el código fuente: cualquiera podía
-leerlas. El dueño pidió publicar el proyecto SIN contraseñas — que cada
-instalación use las que elija el usuario.
+El repositorio es público y las claves por defecto históricas estaban
+escritas en el código fuente: cualquiera podía leerlas. El dueño pidió
+publicar el proyecto SIN contraseñas — que cada instalación use las que
+elija el usuario. Las claves concretas no se nombran ni aquí ni en los
+tests (el test guardián las guarda invertidas).
 
 ## Alcance
 
@@ -49,8 +50,9 @@ instalación use las que elija el usuario.
 - [x] Con BD nueva, la app pide crear las dos cuentas antes del login;
       cancelar cierra la app.
 - [x] Las claves elegidas quedan con hash PBKDF2 y sirven para entrar.
-- [x] `admin123`/`venta123`/`venta456`/`venta789` no existen en
-      `pos_abarrotes.py` (test guardián `test_codigo_sin_claves_quemadas`).
+- [x] Ninguna clave por defecto histórica existe en `pos_abarrotes.py`
+      (test guardián `test_codigo_sin_claves_quemadas`, con las claves
+      invertidas para no publicarlas ni en el test).
 - [x] Una BD existente (con usuarios) NO muestra el diálogo y sus
       usuarios entran igual que siempre.
 - [x] `py -m pytest` en verde (40 tests).
