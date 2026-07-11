@@ -11,10 +11,13 @@ Requiere:  pip install PySide6
 
 import sys
 import sqlite3
+import csv
 import hashlib
+import hmac
 import json
 import random
 import re
+import secrets
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -25,10 +28,18 @@ from PySide6.QtWidgets import (
     QMessageBox, QSpinBox, QDoubleSpinBox, QHeaderView,
     QComboBox, QGroupBox, QDialog, QFormLayout,
     QStatusBar, QDateEdit, QGridLayout, QDialogButtonBox,
-    QPlainTextEdit, QScrollArea, QFrame,
+    QPlainTextEdit, QScrollArea, QFrame, QFileDialog, QCheckBox,
 )
-from PySide6.QtCore import Qt, QDate, QTimer
-from PySide6.QtGui import QColor, QImage, QMovie, QPixmap, QTransform
+from PySide6.QtCore import Qt, QDate, QTimer, QMarginsF
+from PySide6.QtGui import (
+    QColor, QImage, QMovie, QPixmap, QTransform,
+    QTextDocument, QPdfWriter, QPageLayout, QPageSize,
+    QPainter, QPen,
+)
+from PySide6.QtCharts import (
+    QChart, QChartView, QBarSeries, QBarSet, QBarCategoryAxis,
+    QHorizontalBarSeries, QLineSeries, QValueAxis,
+)
 
 # ──────────────────────────────────────────────────────────
 # CONFIGURACIÓN
@@ -37,6 +48,9 @@ from PySide6.QtGui import QColor, QImage, QMovie, QPixmap, QTransform
 DB_NAME = "abarrotes_pos.db"
 BACKUP_DB_NAME = "abarrotes_pos_respaldo.db"
 CODIGO_MANUAL_PREFIX = "MANUAL-"
+# Costo del hash de contraseñas (PBKDF2-HMAC-SHA256). Solo se paga al
+# iniciar sesión o cambiar la contraseña, nunca durante la venta.
+ITERACIONES_PBKDF2 = 600_000
 APP_DIR = (
     Path(sys.executable).resolve().parent
     if getattr(sys, "frozen", False)
@@ -290,7 +304,56 @@ def agregar_columna_si_falta(conn, tabla, columna, definicion):
 
 
 def hash_password(contrasena):
+    """Hash LEGADO (SHA-256 sin sal). Se conserva únicamente para verificar
+    contraseñas guardadas por versiones anteriores; todo hash nuevo se
+    escribe con hash_password_pbkdf2()."""
     return hashlib.sha256(contrasena.encode("utf-8")).hexdigest()
+
+
+def hash_password_pbkdf2(contrasena, sal_hex=None, iteraciones=None):
+    """Hash PBKDF2-HMAC-SHA256 con sal aleatoria por usuario, en formato
+    autodescriptivo `pbkdf2$<iteraciones>$<sal>$<hash>` (cabe en la misma
+    columna password_hash; sin cambios de esquema)."""
+    iteraciones = iteraciones or ITERACIONES_PBKDF2
+    sal_hex = sal_hex or secrets.token_hex(16)
+    derivado = hashlib.pbkdf2_hmac(
+        "sha256", contrasena.encode("utf-8"),
+        bytes.fromhex(sal_hex), iteraciones,
+    )
+    return f"pbkdf2${iteraciones}${sal_hex}${derivado.hex()}"
+
+
+def verificar_password(contrasena, hash_guardado):
+    """True si la contraseña corresponde al hash guardado, sea formato
+    nuevo (pbkdf2$...) o legado (SHA-256 sin sal)."""
+    if not hash_guardado:
+        return False
+    if hash_guardado.startswith("pbkdf2$"):
+        try:
+            _, iteraciones, sal_hex, _ = hash_guardado.split("$")
+            recalculado = hash_password_pbkdf2(
+                contrasena, sal_hex, int(iteraciones))
+        except (ValueError, TypeError):
+            return False
+        return hmac.compare_digest(recalculado, hash_guardado)
+    return hmac.compare_digest(hash_password(contrasena), hash_guardado)
+
+
+def es_password_por_defecto(contrasena):
+    return contrasena in {clave for _u, _n, _r, clave in USUARIOS_INICIALES}
+
+
+def cambiar_password(usuario_id, nueva):
+    """Valida la contraseña nueva y la guarda con hash PBKDF2.
+    Levanta ValueError con mensaje humano si no cumple las reglas."""
+    if not nueva or not nueva.strip():
+        raise ValueError("La contraseña nueva no puede estar vacía.")
+    if es_password_por_defecto(nueva):
+        raise ValueError("Esa es una de las claves por defecto del sistema.\n"
+                         "Elige una contraseña diferente.")
+    with conectar() as conn:
+        conn.execute("UPDATE usuarios SET password_hash = ? WHERE id = ?",
+                     (hash_password_pbkdf2(nueva), usuario_id))
 
 
 def crear_usuarios_iniciales(conn):
@@ -301,7 +364,7 @@ def crear_usuarios_iniciales(conn):
                 (usuario, nombre, rol, password_hash, activo, fecha_alta)
             VALUES (?, ?, ?, ?, 1, ?)
         """, (
-            usuario, nombre, rol, hash_password(contrasena),
+            usuario, nombre, rol, hash_password_pbkdf2(contrasena),
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         ))
 
@@ -320,14 +383,22 @@ def validar_login(usuario, contrasena):
         return None
 
     uid, user, nombre, rol, password_hash = row
-    if hash_password(contrasena) != password_hash:
+    if not verificar_password(contrasena, password_hash):
         return None
+
+    # Migración silenciosa: hash legado (SHA-256 sin sal) → PBKDF2.
+    # El formato viejo nunca se rechaza; solo se actualiza al entrar.
+    if not password_hash.startswith("pbkdf2$"):
+        with conectar() as conn:
+            conn.execute("UPDATE usuarios SET password_hash = ? WHERE id = ?",
+                         (hash_password_pbkdf2(contrasena), uid))
 
     return {
         "id": uid,
         "usuario": user,
         "nombre": nombre,
         "rol": rol,
+        "password_por_defecto": es_password_por_defecto(contrasena),
     }
 
 
@@ -678,6 +749,10 @@ def crear_tablas():
         agregar_columna_si_falta(conn, "sesiones_usuario", "observaciones", "TEXT DEFAULT ''")
         agregar_columna_si_falta(conn, "sesiones_usuario", "corte_cerrado", "INTEGER DEFAULT 0")
         agregar_columna_si_falta(conn, "ticket_pendiente", "vendedor_nombre", "TEXT DEFAULT ''")
+        # Feature 003: 0 = por pieza (default), 1 = a granel (precio por kg,
+        # stock/cantidades en kg con decimales — la afinidad de SQLite los
+        # guarda como REAL en las columnas INTEGER existentes).
+        agregar_columna_si_falta(conn, "productos", "es_granel", "INTEGER DEFAULT 0")
         crear_usuarios_iniciales(conn)
 
 
@@ -891,6 +966,238 @@ def separar_fecha_hora(fecha_hora):
         return fecha, hora
 
 
+# ──────────────────────────────────────────────────────────
+# PRODUCTOS A GRANEL: peso, monto y formateo de cantidades
+# (lógica sin UI — ver spec/features/003-productos-a-granel)
+# ──────────────────────────────────────────────────────────
+
+TOLERANCIA_PESO = 1e-6   # 1 miligramo: colchón para comparaciones float
+
+
+def redondear_peso(kg):
+    """Peso en kg redondeado al gramo (3 decimales)."""
+    return round(float(kg), 3)
+
+
+def peso_desde_monto(monto, precio_kg):
+    """Peso equivalente (al gramo) de cobrar `monto` con un precio por
+    kilo. Levanta ValueError con mensaje humano si el precio no sirve."""
+    if not precio_kg or precio_kg <= 0:
+        raise ValueError("Este producto no tiene precio por kilo.\n"
+                         "Corrígelo en el inventario antes de venderlo.")
+    return redondear_peso(monto / precio_kg)
+
+
+def formatear_cantidad(cantidad, es_granel=False):
+    """Cantidad para mostrar: piezas enteras («3»), granel en kg
+    («0.250 kg»). Único punto de formateo de cantidades en la app."""
+    if es_granel:
+        return f"{redondear_peso(cantidad):.3f} kg"
+    return str(int(round(cantidad)))
+
+
+def formatear_cantidad_mixta(valor):
+    """Suma de cantidades que puede mezclar piezas y kg (reportes):
+    entero si cuadra exacto, si no con 3 decimales (gramos)."""
+    redondeado = redondear_peso(valor or 0)
+    if redondeado == int(redondeado):
+        return str(int(redondeado))
+    return f"{redondeado:.3f}"
+
+
+# ──────────────────────────────────────────────────────────
+# REPORTES AMPLIADOS: comparativas, series y exportación
+# (lógica sin UI — ver spec/features/001-reportes-ampliados)
+# ──────────────────────────────────────────────────────────
+
+def rango_semana(fecha=None):
+    """Lunes a domingo de la semana de `fecha` (date u hoy). Devuelve
+    ('YYYY-MM-DD', 'YYYY-MM-DD')."""
+    fecha = fecha or datetime.now().date()
+    lunes = fecha - timedelta(days=fecha.weekday())
+    domingo = lunes + timedelta(days=6)
+    return lunes.strftime("%Y-%m-%d"), domingo.strftime("%Y-%m-%d")
+
+
+def rango_mes(fecha=None):
+    """Primer y último día del mes de `fecha` (date u hoy)."""
+    fecha = fecha or datetime.now().date()
+    primero = fecha.replace(day=1)
+    siguiente = (primero + timedelta(days=32)).replace(day=1)
+    ultimo = siguiente - timedelta(days=1)
+    return primero.strftime("%Y-%m-%d"), ultimo.strftime("%Y-%m-%d")
+
+
+def periodo_anterior(inicio, fin, modo="libre"):
+    """Periodo de comparación para un rango inclusivo de días.
+
+    modo 'mes': el mes calendario anterior al mes de `inicio` (los meses
+    no miden lo mismo). Cualquier otro modo: el mismo número de días
+    inmediatamente antes de `inicio`.
+    """
+    d_inicio = datetime.strptime(inicio, "%Y-%m-%d").date()
+    if modo == "mes":
+        ultimo_ant = d_inicio.replace(day=1) - timedelta(days=1)
+        return rango_mes(ultimo_ant)
+    d_fin = datetime.strptime(fin, "%Y-%m-%d").date()
+    dias = (d_fin - d_inicio).days + 1
+    fin_ant = d_inicio - timedelta(days=1)
+    inicio_ant = fin_ant - timedelta(days=dias - 1)
+    return inicio_ant.strftime("%Y-%m-%d"), fin_ant.strftime("%Y-%m-%d")
+
+
+def metricas_periodo(inicio, fin):
+    """Venta, ganancia, nº de ventas y ticket promedio del rango de días.
+
+    Usa la misma expresión de costo que los reportes existentes para que
+    las cifras cuadren entre pestañas.
+    """
+    desde, hasta = f"{inicio} 00:00:00", f"{fin} 23:59:59"
+    with conectar() as conn:
+        c = conn.cursor()
+        c.execute("""
+            WITH ventas_costos AS (
+                SELECT v.id, v.total,
+                       COALESCE(SUM(COALESCE(NULLIF(d.costo_total, 0),
+                                d.cantidad * COALESCE(p.precio_compra, 0), 0)), 0) AS costo
+                FROM ventas v
+                LEFT JOIN detalle_ventas d ON d.venta_id = v.id
+                LEFT JOIN productos p ON p.id = d.producto_id
+                WHERE v.fecha >= ? AND v.fecha <= ?
+                GROUP BY v.id, v.total
+            )
+            SELECT COUNT(*), COALESCE(SUM(total), 0),
+                   COALESCE(SUM(total - costo), 0)
+            FROM ventas_costos
+        """, (desde, hasta))
+        num_ventas, venta, ganancia = c.fetchone()
+    ticket = venta / num_ventas if num_ventas else 0.0
+    return {
+        "num_ventas": num_ventas,
+        "venta": venta,
+        "ganancia": ganancia,
+        "ticket_promedio": ticket,
+    }
+
+
+def comparar_periodos(inicio, fin, modo="libre"):
+    """Métricas del rango contra su periodo anterior (ver periodo_anterior).
+
+    Devuelve dict con los rangos y `filas`: (métrica, actual, anterior,
+    diferencia, porcentaje o None si el anterior fue 0).
+    """
+    inicio_ant, fin_ant = periodo_anterior(inicio, fin, modo)
+    actual = metricas_periodo(inicio, fin)
+    anterior = metricas_periodo(inicio_ant, fin_ant)
+    filas = []
+    for clave, etiqueta in [
+        ("venta", "Venta total"),
+        ("ganancia", "Ganancia"),
+        ("num_ventas", "Número de ventas"),
+        ("ticket_promedio", "Ticket promedio"),
+    ]:
+        val_actual, val_anterior = actual[clave], anterior[clave]
+        diferencia = val_actual - val_anterior
+        porcentaje = (diferencia / val_anterior * 100) if val_anterior else None
+        filas.append((etiqueta, val_actual, val_anterior, diferencia, porcentaje))
+    return {
+        "actual": (inicio, fin),
+        "anterior": (inicio_ant, fin_ant),
+        "filas": filas,
+    }
+
+
+def ventas_por_dia(inicio, fin):
+    """Venta total por día del rango, incluyendo días sin ventas (en 0),
+    para graficar sin huecos. Devuelve [('YYYY-MM-DD', total), ...]."""
+    desde, hasta = f"{inicio} 00:00:00", f"{fin} 23:59:59"
+    with conectar() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT strftime('%Y-%m-%d', fecha), COALESCE(SUM(total), 0)
+            FROM ventas
+            WHERE fecha >= ? AND fecha <= ?
+            GROUP BY 1
+        """, (desde, hasta))
+        por_dia = dict(c.fetchall())
+    filas = []
+    dia = datetime.strptime(inicio, "%Y-%m-%d").date()
+    d_fin = datetime.strptime(fin, "%Y-%m-%d").date()
+    while dia <= d_fin:
+        clave = dia.strftime("%Y-%m-%d")
+        filas.append((clave, por_dia.get(clave, 0)))
+        dia += timedelta(days=1)
+    return filas
+
+
+def ventas_por_hora_rango(inicio, fin):
+    """Ventas por hora del día (0–23 completas, en 0 si no hubo) del rango.
+    Devuelve [(hora, num_ventas, venta_total), ...]."""
+    desde, hasta = f"{inicio} 00:00:00", f"{fin} 23:59:59"
+    with conectar() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT CAST(strftime('%H', fecha) AS INTEGER),
+                   COUNT(*), COALESCE(SUM(total), 0)
+            FROM ventas
+            WHERE fecha >= ? AND fecha <= ?
+            GROUP BY 1
+        """, (desde, hasta))
+        por_hora = {h: (n, t) for h, n, t in c.fetchall()}
+    return [(h, *por_hora.get(h, (0, 0))) for h in range(24)]
+
+
+def ganancia_por_categoria_rango(inicio, fin):
+    """Ganancia por categoría en el rango, de mayor a menor.
+    Devuelve [(categoria, ganancia), ...]."""
+    desde, hasta = f"{inicio} 00:00:00", f"{fin} 23:59:59"
+    with conectar() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT COALESCE(NULLIF(p.categoria, ''), 'Sin categoría') AS categoria,
+                   COALESCE(SUM(d.subtotal - COALESCE(NULLIF(d.costo_total, 0),
+                            d.cantidad * COALESCE(p.precio_compra, 0), 0)), 0) AS ganancia
+            FROM detalle_ventas d
+            JOIN ventas v ON v.id = d.venta_id
+            JOIN productos p ON p.id = d.producto_id
+            WHERE v.fecha >= ? AND v.fecha <= ?
+            GROUP BY categoria
+            ORDER BY ganancia DESC
+        """, (desde, hasta))
+        return c.fetchall()
+
+
+def exportar_tabla_csv(ruta, columnas, filas):
+    """Escribe columnas + filas en CSV con BOM UTF-8 (Excel respeta acentos)."""
+    with open(ruta, "w", newline="", encoding="utf-8-sig") as f:
+        escritor = csv.writer(f)
+        escritor.writerow(columnas)
+        for fila in filas:
+            escritor.writerow(list(fila))
+
+
+def tabla_a_html(titulo, subtitulo, columnas, filas):
+    """HTML imprimible (para el PDF vía QTextDocument) con título, rango
+    y la tabla del reporte."""
+    def esc(v):
+        return (str(v).replace("&", "&amp;")
+                      .replace("<", "&lt;").replace(">", "&gt;"))
+    generado = datetime.now().strftime("%d/%m/%Y %H:%M")
+    encabezados = "".join(f"<th>{esc(c)}</th>" for c in columnas)
+    cuerpo = "".join(
+        "<tr>" + "".join(f"<td>{esc(v)}</td>" for v in fila) + "</tr>"
+        for fila in filas
+    )
+    return f"""
+    <h2>{esc(titulo)}</h2>
+    <p>{esc(subtitulo)}<br>Generado: {generado}</p>
+    <table border="1" cellspacing="0" cellpadding="4" width="100%">
+        <tr>{encabezados}</tr>
+        {cuerpo}
+    </table>
+    """
+
+
 class _CasillaSeleccionMixin:
     def _seleccionar_texto(self):
         QTimer.singleShot(0, self.lineEdit().selectAll)
@@ -927,30 +1234,52 @@ class CasillaMonto(_CasillaSeleccionMixin, QDoubleSpinBox):
         self._actualizar_texto_cero()
 
 
+class CasillaPeso(_CasillaSeleccionMixin, QDoubleSpinBox):
+    """Captura de peso en kilos con precisión de gramo (3 decimales)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDecimals(3)
+        self.setSuffix(" kg")
+        self.setSingleStep(0.1)
+        self._actualizar_texto_cero()
+
+
 # ──────────────────────────────────────────────────────────
 # DIÁLOGO — AJUSTE DE STOCK
 # ──────────────────────────────────────────────────────────
 
 class DialogoAjusteStock(QDialog):
-    def __init__(self, nombre, stock_actual, parent=None):
+    def __init__(self, nombre, stock_actual, es_granel=False, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Ajustar stock — {nombre}")
         self.setMinimumWidth(380)
+        self._es_granel = es_granel
         lay = QFormLayout(self)
         lay.setSpacing(10)
 
-        lay.addRow("Stock actual:", QLabel(f"<b>{stock_actual}</b> unidades"))
+        if es_granel:
+            stock_txt = f"<b>{formatear_cantidad(stock_actual, True)}</b>"
+            unidad = "peso en kg"
+        else:
+            stock_txt = f"<b>{formatear_cantidad(stock_actual)}</b> unidades"
+            unidad = "unidades"
+        lay.addRow("Stock actual:", QLabel(stock_txt))
 
         self._combo = QComboBox()
         self._combo.addItems([
-            "ENTRADA  (agregar unidades)",
-            "SALIDA   (retirar unidades)",
+            f"ENTRADA  (agregar {unidad})",
+            f"SALIDA   (retirar {unidad})",
             "AJUSTE   (establecer valor exacto)",
         ])
         lay.addRow("Tipo de movimiento:", self._combo)
 
-        self._spin = CasillaEntero()
-        self._spin.setRange(1, 999_999)
+        if es_granel:
+            self._spin = CasillaPeso()
+            self._spin.setRange(0.001, 999_999)
+        else:
+            self._spin = CasillaEntero()
+            self._spin.setRange(1, 999_999)
         lay.addRow("Cantidad:", self._spin)
 
         self._motivo = QLineEdit()
@@ -970,9 +1299,12 @@ class DialogoAjusteStock(QDialog):
             tipo = "SALIDA"
         else:
             tipo = "AJUSTE"
+        cantidad = self._spin.value()
+        if self._es_granel:
+            cantidad = redondear_peso(cantidad)
         return {
             "tipo": tipo,
-            "cantidad": self._spin.value(),
+            "cantidad": cantidad,
             "motivo": self._motivo.text().strip() or "Ajuste manual",
         }
 
@@ -1025,21 +1357,32 @@ class DialogoCambioPrecio(QDialog):
 
 
 class DialogoEntradaInventario(QDialog):
-    def __init__(self, nombre, stock_actual, compra_actual, venta_actual, parent=None):
+    def __init__(self, nombre, stock_actual, compra_actual, venta_actual,
+                 es_granel=False, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Añadir stock — {nombre}")
         self.setMinimumWidth(430)
+        self._es_granel = es_granel
         lay = QFormLayout(self)
         lay.setSpacing(10)
 
+        sufijo_kg = " /kg" if es_granel else ""
+        stock_txt = (f"<b>{formatear_cantidad(stock_actual, True)}</b>"
+                     if es_granel else
+                     f"<b>{formatear_cantidad(stock_actual)}</b> unidades")
         lay.addRow("Producto:", QLabel(f"<b>{nombre}</b>"))
-        lay.addRow("Stock actual:", QLabel(f"<b>{stock_actual}</b> unidades"))
-        lay.addRow("Compra actual:", QLabel(f"<b>${compra_actual:.2f}</b>"))
-        lay.addRow("Venta actual:", QLabel(f"<b>${venta_actual:.2f}</b>"))
+        lay.addRow("Stock actual:", QLabel(stock_txt))
+        lay.addRow("Compra actual:", QLabel(f"<b>${compra_actual:.2f}{sufijo_kg}</b>"))
+        lay.addRow("Venta actual:", QLabel(f"<b>${venta_actual:.2f}{sufijo_kg}</b>"))
 
-        self._spin_cantidad = CasillaEntero()
-        self._spin_cantidad.setRange(1, 999_999)
-        lay.addRow("Cantidad a añadir:", self._spin_cantidad)
+        if es_granel:
+            self._spin_cantidad = CasillaPeso()
+            self._spin_cantidad.setRange(0.001, 999_999)
+            lay.addRow("Peso a añadir:", self._spin_cantidad)
+        else:
+            self._spin_cantidad = CasillaEntero()
+            self._spin_cantidad.setRange(1, 999_999)
+            lay.addRow("Cantidad a añadir:", self._spin_cantidad)
 
         self._spin_compra = CasillaMonto()
         self._spin_compra.setRange(0, 999_999)
@@ -1065,11 +1408,165 @@ class DialogoEntradaInventario(QDialog):
         lay.addRow(bts)
 
     def resultado(self):
+        cantidad = self._spin_cantidad.value()
+        if self._es_granel:
+            cantidad = redondear_peso(cantidad)
         return {
-            "cantidad": self._spin_cantidad.value(),
+            "cantidad": cantidad,
             "compra": self._spin_compra.value(),
             "venta": self._spin_venta.value(),
             "motivo": self._motivo.text().strip() or "Entrada de inventario",
+        }
+
+
+class DialogoVentaGranel(QDialog):
+    """Captura de una venta por peso: kg ⇄ gramos sincronizados, monto en
+    $ que calcula el peso, atajos de mostrador (¼/½/¾/1 kg) y vista previa
+    del cobro. Si el vendedor capturó un monto («dame $30»), el subtotal
+    es EXACTAMENTE ese monto y el peso queda redondeado al gramo."""
+
+    def __init__(self, nombre, precio_kg, stock_disponible, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Venta a granel — {nombre}")
+        self.setMinimumWidth(430)
+        self._precio_kg = precio_kg
+        self._stock = stock_disponible
+        self._sincronizando = False
+        self._monto_manual = False   # el último campo tocado fue el monto
+
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+
+        titulo = QLabel(nombre)
+        titulo.setObjectName("lbl_titulo")
+        titulo.setAlignment(Qt.AlignCenter)
+        lay.addWidget(titulo)
+
+        info = QLabel(
+            f"Precio: ${precio_kg:.2f} /kg   ·   "
+            f"Disponible: {formatear_cantidad(stock_disponible, True)}"
+        )
+        info.setAlignment(Qt.AlignCenter)
+        info.setStyleSheet("color: #a6adc8;")
+        lay.addWidget(info)
+
+        hl = QHBoxLayout()
+        for etiqueta, kg in (("¼ kg", 0.25), ("½ kg", 0.5),
+                             ("¾ kg", 0.75), ("1 kg", 1.0)):
+            btn = QPushButton(etiqueta)
+            btn.clicked.connect(lambda _=False, k=kg: self._poner_peso(k))
+            hl.addWidget(btn)
+        lay.addLayout(hl)
+
+        form = QFormLayout()
+        form.setSpacing(10)
+
+        self._inp_kg = CasillaPeso()
+        self._inp_kg.setRange(0, 999_999)
+        self._inp_kg.valueChanged.connect(self._desde_kg)
+        form.addRow("Peso (kg):", self._inp_kg)
+
+        self._inp_gr = CasillaEntero()
+        self._inp_gr.setRange(0, 999_999_999)
+        self._inp_gr.setSuffix(" g")
+        self._inp_gr.valueChanged.connect(self._desde_gr)
+        form.addRow("Peso (gramos):", self._inp_gr)
+
+        self._inp_monto = CasillaMonto()
+        self._inp_monto.setRange(0, 999_999)
+        self._inp_monto.setPrefix("$")
+        self._inp_monto.setDecimals(2)
+        self._inp_monto.valueChanged.connect(self._desde_monto)
+        form.addRow("Monto ($):", self._inp_monto)
+
+        lay.addLayout(form)
+
+        self._lbl_previa = QLabel("Captura un peso o un monto")
+        self._lbl_previa.setAlignment(Qt.AlignCenter)
+        self._lbl_previa.setStyleSheet(
+            "color: #a6e3a1; font-size: 16px; font-weight: bold;")
+        lay.addWidget(self._lbl_previa)
+
+        bts = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bts.button(QDialogButtonBox.Ok).setText("Agregar al ticket")
+        bts.button(QDialogButtonBox.Cancel).setText("Cancelar")
+        bts.accepted.connect(self._aceptar)
+        bts.rejected.connect(self.reject)
+        lay.addWidget(bts)
+
+        self._inp_kg.setFocus()
+
+    def _poner_peso(self, kg):
+        self._inp_kg.setValue(kg)   # dispara _desde_kg
+
+    def _desde_kg(self, kg):
+        if self._sincronizando:
+            return
+        self._sincronizando = True
+        self._inp_gr.setValue(int(round(kg * 1000)))
+        self._inp_monto.setValue(round(kg * self._precio_kg, 2))
+        self._monto_manual = False
+        self._sincronizando = False
+        self._actualizar_previa()
+
+    def _desde_gr(self, gramos):
+        if self._sincronizando:
+            return
+        self._sincronizando = True
+        kg = redondear_peso(gramos / 1000)
+        self._inp_kg.setValue(kg)
+        self._inp_monto.setValue(round(kg * self._precio_kg, 2))
+        self._monto_manual = False
+        self._sincronizando = False
+        self._actualizar_previa()
+
+    def _desde_monto(self, monto):
+        if self._sincronizando:
+            return
+        self._sincronizando = True
+        try:
+            kg = peso_desde_monto(monto, self._precio_kg)
+        except ValueError:
+            kg = 0.0
+        self._inp_kg.setValue(kg)
+        self._inp_gr.setValue(int(round(kg * 1000)))
+        self._monto_manual = True
+        self._sincronizando = False
+        self._actualizar_previa()
+
+    def _subtotal(self):
+        kg = redondear_peso(self._inp_kg.value())
+        if self._monto_manual and self._inp_monto.value() > 0:
+            return round(self._inp_monto.value(), 2)
+        return round(kg * self._precio_kg, 2)
+
+    def _actualizar_previa(self):
+        kg = redondear_peso(self._inp_kg.value())
+        if kg <= 0:
+            self._lbl_previa.setText("Captura un peso o un monto")
+            return
+        self._lbl_previa.setText(
+            f"{formatear_cantidad(kg, True)}  ×  ${self._precio_kg:.2f}/kg"
+            f"   =   ${self._subtotal():.2f}"
+        )
+
+    def _aceptar(self):
+        kg = redondear_peso(self._inp_kg.value())
+        if kg <= 0:
+            QMessageBox.warning(self, "Sin peso",
+                                "Captura el peso (kg o gramos) o el monto a vender.")
+            return
+        if kg > self._stock + TOLERANCIA_PESO:
+            QMessageBox.warning(
+                self, "Stock insuficiente",
+                f"Solo hay {formatear_cantidad(self._stock, True)} disponibles.")
+            return
+        self.accept()
+
+    def resultado(self):
+        return {
+            "cantidad": redondear_peso(self._inp_kg.value()),
+            "subtotal": self._subtotal(),
         }
 
 
@@ -1165,7 +1662,8 @@ class DialogoDetalleVenta(QDialog):
                 SELECT p.nombre, p.codigo_barras,
                        d.cantidad, d.precio_unitario, d.subtotal,
                        COALESCE(NULLIF(d.costo_unitario, 0), p.precio_compra, 0),
-                       COALESCE(NULLIF(d.costo_total, 0), d.cantidad * COALESCE(p.precio_compra, 0), 0)
+                       COALESCE(NULLIF(d.costo_total, 0), d.cantidad * COALESCE(p.precio_compra, 0), 0),
+                       COALESCE(p.es_granel, 0)
                 FROM detalle_ventas d
                 JOIN productos p ON d.producto_id = p.id
                 WHERE d.venta_id = ?
@@ -1184,10 +1682,12 @@ class DialogoDetalleVenta(QDialog):
         )
 
         tabla.setRowCount(len(filas))
-        for i, (nom, cod, cant, precio, sub, costo_unit, costo_total) in enumerate(filas):
+        for i, (nom, cod, cant, precio, sub, costo_unit, costo_total,
+                es_granel) in enumerate(filas):
             ganancia = sub - costo_total
             valores = [
-                nom, codigo_visible(cod), str(cant), f"${precio:.2f}",
+                nom, codigo_visible(cod), formatear_cantidad(cant, es_granel),
+                f"${precio:.2f}{' /kg' if es_granel else ''}",
                 f"${sub:.2f}", f"${costo_total:.2f}", f"${ganancia:.2f}",
             ]
             for j, v in enumerate(valores):
@@ -1248,7 +1748,6 @@ class DialogoLogin(QDialog):
         lay.addWidget(btns)
 
         ayuda = QLabel(
-            "Usuarios iniciales: admin/admin123 y vendedor/venta123. "
             "El nombre real del vendedor se pide al abrir caja."
         )
         ayuda.setWordWrap(True)
@@ -1275,6 +1774,136 @@ class DialogoLogin(QDialog):
             return
 
         self.usuario_actual = usuario_actual
+        self.accept()
+
+
+class DialogoCambioContrasena(QDialog):
+    """Cambio de contraseña en tres modos:
+    - "forzado": tras entrar con una clave por defecto; no pide la actual
+      (quien llama decide qué pasa si se cancela: regresar al login).
+    - "voluntario": el usuario cambia la suya; exige la actual.
+    - "admin": incluye combo de usuarios activos; para sí mismo exige la
+      actual, para otros la asigna directo (reseteo)."""
+
+    def __init__(self, usuario_actual, modo="voluntario", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Cambiar contraseña")
+        self.setMinimumWidth(390)
+        self._usuario_actual = usuario_actual
+        self._modo = modo
+
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+
+        titulo = QLabel("Elige tu contraseña nueva" if modo == "forzado"
+                        else "Cambiar contraseña")
+        titulo.setObjectName("lbl_titulo")
+        titulo.setAlignment(Qt.AlignCenter)
+        lay.addWidget(titulo)
+
+        if modo == "forzado":
+            aviso = QLabel(
+                "Entraste con una clave por defecto del sistema. "
+                "Por seguridad debes elegir una contraseña nueva "
+                "antes de usar la caja."
+            )
+            aviso.setWordWrap(True)
+            aviso.setStyleSheet("color: #f9e2af;")
+            lay.addWidget(aviso)
+
+        self._form = QFormLayout()
+        self._form.setSpacing(10)
+
+        self._combo_usuario = None
+        if modo == "admin":
+            self._combo_usuario = QComboBox()
+            with conectar() as conn:
+                usuarios = conn.execute("""
+                    SELECT id, usuario, nombre FROM usuarios
+                    WHERE activo = 1 ORDER BY usuario
+                """).fetchall()
+            for uid, usuario, nombre in usuarios:
+                etiqueta = f"{usuario} — {nombre}"
+                if uid == usuario_actual["id"]:
+                    etiqueta += " (yo)"
+                self._combo_usuario.addItem(etiqueta, uid)
+            indice_yo = self._combo_usuario.findData(usuario_actual["id"])
+            self._combo_usuario.setCurrentIndex(max(indice_yo, 0))
+            self._combo_usuario.currentIndexChanged.connect(
+                self._actualizar_campo_actual)
+            self._form.addRow("Usuario:", self._combo_usuario)
+
+        self._inp_actual = QLineEdit()
+        self._inp_actual.setEchoMode(QLineEdit.Password)
+        self._fila_actual = self._form.rowCount()
+        if modo != "forzado":
+            self._form.addRow("Contraseña actual:", self._inp_actual)
+
+        self._inp_nueva = QLineEdit()
+        self._inp_nueva.setEchoMode(QLineEdit.Password)
+        self._form.addRow("Contraseña nueva:", self._inp_nueva)
+
+        self._inp_confirmar = QLineEdit()
+        self._inp_confirmar.setEchoMode(QLineEdit.Password)
+        self._form.addRow("Confirmar nueva:", self._inp_confirmar)
+
+        lay.addLayout(self._form)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("Guardar")
+        btns.button(QDialogButtonBox.Cancel).setText("Cancelar")
+        btns.accepted.connect(self._guardar)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+        self._actualizar_campo_actual()
+
+    def _usuario_objetivo(self):
+        if self._combo_usuario is not None:
+            return self._combo_usuario.currentData()
+        return self._usuario_actual["id"]
+
+    def _requiere_actual(self):
+        # El reseteo por admin a OTRO usuario no exige la contraseña
+        # anterior; el cambio propio (salvo el forzado) siempre sí.
+        if self._modo == "forzado":
+            return False
+        return self._usuario_objetivo() == self._usuario_actual["id"]
+
+    def _actualizar_campo_actual(self):
+        if self._modo == "admin":
+            self._form.setRowVisible(self._fila_actual, self._requiere_actual())
+
+    def _guardar(self):
+        nueva = self._inp_nueva.text()
+        if nueva != self._inp_confirmar.text():
+            QMessageBox.warning(self, "No coincide",
+                                "La contraseña nueva y su confirmación "
+                                "no coinciden.")
+            self._inp_confirmar.clear()
+            self._inp_confirmar.setFocus()
+            return
+
+        if self._requiere_actual():
+            with conectar() as conn:
+                fila = conn.execute(
+                    "SELECT password_hash FROM usuarios WHERE id = ?",
+                    (self._usuario_actual["id"],)).fetchone()
+            if not fila or not verificar_password(self._inp_actual.text(), fila[0]):
+                QMessageBox.warning(self, "Contraseña actual incorrecta",
+                                    "La contraseña actual no es correcta.")
+                self._inp_actual.clear()
+                self._inp_actual.setFocus()
+                return
+
+        try:
+            cambiar_password(self._usuario_objetivo(), nueva)
+        except (ValueError, sqlite3.Error) as e:
+            QMessageBox.warning(self, "No se pudo cambiar", mensaje_error_db(e))
+            return
+
+        QMessageBox.information(self, "Contraseña cambiada",
+                                "La contraseña se guardó correctamente.")
         self.accept()
 
 
@@ -2156,7 +2785,8 @@ class DialogoHistorialCliente(QDialog):
                 SELECT p.id, p.fecha, pr.nombre, d.cantidad, d.precio_unitario,
                        d.estado, COALESCE(d.fecha_estado, ''),
                        COALESCE(NULLIF(d.vendedor_nombre, ''),
-                                NULLIF(p.vendedor_nombre, ''), 'Sin registro')
+                                NULLIF(p.vendedor_nombre, ''), 'Sin registro'),
+                       COALESCE(pr.es_granel, 0)
                 FROM prestamos p
                 JOIN detalle_prestamos d ON d.prestamo_id = p.id
                 JOIN productos pr ON pr.id = d.producto_id
@@ -2211,9 +2841,11 @@ class DialogoHistorialCliente(QDialog):
             "COBRADO": QColor("#89b4fa"),
         }
         self._tabla_pre.setRowCount(len(prestamos))
-        for fila, (pid, fecha, prod, cant, precio, estado, fecha_e, vendedor) in enumerate(prestamos):
+        for fila, (pid, fecha, prod, cant, precio, estado, fecha_e,
+                   vendedor, es_granel) in enumerate(prestamos):
             valores = [
-                f"#{pid}", fecha, prod, str(cant), f"${precio:.2f}",
+                f"#{pid}", fecha, prod, formatear_cantidad(cant, es_granel),
+                f"${precio:.2f}{' /kg' if es_granel else ''}",
                 f"${cant * precio:.2f}", estado, fecha_e, vendedor,
             ]
             for col, val in enumerate(valores):
@@ -2334,7 +2966,8 @@ class DialogoDetallePrestamo(QDialog):
             c.execute("""
                 SELECT d.id, pr.nombre, pr.codigo_barras, d.cantidad,
                        d.precio_unitario, d.estado, COALESCE(d.fecha_estado, ''),
-                       COALESCE(NULLIF(d.vendedor_nombre, ''), '')
+                       COALESCE(NULLIF(d.vendedor_nombre, ''), ''),
+                       COALESCE(pr.es_granel, 0)
                 FROM detalle_prestamos d
                 JOIN productos pr ON pr.id = d.producto_id
                 WHERE d.prestamo_id = ?
@@ -2347,11 +2980,11 @@ class DialogoDetallePrestamo(QDialog):
             self._cliente_id = cliente_id
             tel_txt = f"&nbsp;&nbsp;|&nbsp;&nbsp;Tel: <b>{telefono}</b>" if telefono else ""
             pendiente = sum(
-                cant * precio for _d, _n, _c, cant, precio, est, _f, _v in filas
+                cant * precio for _d, _n, _c, cant, precio, est, _f, _v, _g in filas
                 if est == "PRESTADO"
             )
             total_prestado = sum(
-                cant * precio for _d, _n, _c, cant, precio, _e, _f, _v in filas
+                cant * precio for _d, _n, _c, cant, precio, _e, _f, _v, _g in filas
             )
             self._lbl_info.setText(
                 f"<b>Préstamo #{self._prestamo_id}</b>&nbsp;&nbsp;|&nbsp;&nbsp;"
@@ -2369,10 +3002,13 @@ class DialogoDetallePrestamo(QDialog):
             "COBRADO": QColor("#89b4fa"),
         }
         self._tabla.setRowCount(len(filas))
-        for fila, (did, nombre, codigo, cant, precio, estado, fecha_e, vend_item) in enumerate(filas):
+        for fila, (did, nombre, codigo, cant, precio, estado, fecha_e,
+                   vend_item, es_granel) in enumerate(filas):
             valores = [
-                str(did), nombre, codigo_visible(codigo), str(cant),
-                f"${precio:.2f}", f"${cant * precio:.2f}", estado, fecha_e,
+                str(did), nombre, codigo_visible(codigo),
+                formatear_cantidad(cant, es_granel),
+                f"${precio:.2f}{' /kg' if es_granel else ''}",
+                f"${cant * precio:.2f}", estado, fecha_e,
                 vend_item or "Sin registro",
             ]
             for col, val in enumerate(valores):
@@ -2395,13 +3031,15 @@ class DialogoDetallePrestamo(QDialog):
         with conectar() as conn:
             c = conn.cursor()
             sql = """
-                SELECT id, producto_id, cantidad, precio_unitario, costo_unitario
-                FROM detalle_prestamos
-                WHERE prestamo_id = ? AND estado = 'PRESTADO'
+                SELECT d.id, d.producto_id, d.cantidad, d.precio_unitario,
+                       d.costo_unitario, COALESCE(p.es_granel, 0)
+                FROM detalle_prestamos d
+                JOIN productos p ON p.id = d.producto_id
+                WHERE d.prestamo_id = ? AND d.estado = 'PRESTADO'
             """
             params = [self._prestamo_id]
             if solo_detalle_id is not None:
-                sql += " AND id = ?"
+                sql += " AND d.id = ?"
                 params.append(solo_detalle_id)
             c.execute(sql, params)
             return c.fetchall()
@@ -2427,10 +3065,12 @@ class DialogoDetallePrestamo(QDialog):
                                 "Ese artículo ya fue devuelto o cobrado.")
             return
 
-        _did, producto_id, cantidad, _precio, _costo = items[0]
+        _did, producto_id, cantidad, _precio, _costo, es_granel = items[0]
+        cantidad_txt = (formatear_cantidad(cantidad, True) if es_granel
+                        else f"{cantidad} unidad(es)")
         r = QMessageBox.question(
             self, "Devolver artículo",
-            f"¿Registrar la devolución de {cantidad} unidad(es)?\n\n"
+            f"¿Registrar la devolución de {cantidad_txt}?\n\n"
             f"El producto se reintegrará al inventario.",
             QMessageBox.Yes | QMessageBox.No,
         )
@@ -2461,7 +3101,8 @@ class DialogoDetallePrestamo(QDialog):
                     c, self._cliente_id, "DEVOLUCION",
                     f"Préstamo #{self._prestamo_id}", cantidad * _precio, fecha,
                     self._ctx["usuario_id"], self._ctx["sesion_id"],
-                    self._ctx["vendedor"], f"{nombre_prod} x{cantidad}",
+                    self._ctx["vendedor"],
+                    f"{nombre_prod} x{formatear_cantidad(cantidad, es_granel)}",
                 )
             self._actualizar_estado_prestamo(c)
 
@@ -2484,7 +3125,7 @@ class DialogoDetallePrestamo(QDialog):
                                 "No hay artículos prestados pendientes de cobro.")
             return
 
-        total = sum(cant * precio for _d, _p, cant, precio, _c in items)
+        total = sum(cant * precio for _d, _p, cant, precio, _c, _g in items)
         metodo = self._combo_metodo.currentText()
         r = QMessageBox.question(
             self, "Cobrar préstamo",
@@ -2509,7 +3150,7 @@ class DialogoDetallePrestamo(QDialog):
             ))
             vid = c.lastrowid
 
-            for did, producto_id, cantidad, precio, costo in items:
+            for did, producto_id, cantidad, precio, costo, _es_granel in items:
                 costo = costo or 0
                 c.execute("""
                     INSERT INTO detalle_ventas
@@ -2552,6 +3193,15 @@ def pedir_usuario_y_fondo(parent=None):
     login = DialogoLogin(parent)
     if login.exec() != QDialog.Accepted:
         return None, None
+
+    # Clave por defecto: obligar a elegir una nueva antes de continuar.
+    # Cancelar el diálogo NO deja entrar (regresa al login/salida).
+    if login.usuario_actual.get("password_por_defecto"):
+        cambio = DialogoCambioContrasena(
+            login.usuario_actual, modo="forzado", parent=parent)
+        if cambio.exec() != QDialog.Accepted:
+            return None, None
+        login.usuario_actual["password_por_defecto"] = False
 
     if login.usuario_actual["rol"] == "vendedor":
         nombre_turno = DialogoNombreVendedor(login.usuario_actual, parent)
@@ -2598,7 +3248,10 @@ class POSAbarrotes(QMainWindow):
         self._btn_cerrar_sesion = QPushButton("Cerrar sesión")
         self._btn_cerrar_sesion.setObjectName("btn_naranja")
         self._btn_cerrar_sesion.clicked.connect(self._cerrar_sesion)
+        self._btn_contrasena = QPushButton("🔑 Contraseña")
+        self._btn_contrasena.clicked.connect(self._cambiar_contrasena)
         self._statusbar.addPermanentWidget(self._lbl_sesion)
+        self._statusbar.addPermanentWidget(self._btn_contrasena)
         self._statusbar.addPermanentWidget(self._btn_cerrar_sesion)
 
         tabs = QTabWidget()
@@ -2743,7 +3396,8 @@ class POSAbarrotes(QMainWindow):
             c.execute("""
                 SELECT d.producto_id, p.codigo_barras, p.nombre,
                        d.cantidad, d.precio_unitario, d.costo_unitario,
-                       p.stock, p.activo
+                       p.stock, p.activo, COALESCE(p.es_granel, 0),
+                       d.subtotal
                 FROM detalle_ticket_pendiente d
                 JOIN ticket_pendiente t ON t.usuario_id = d.usuario_id
                 JOIN productos p ON p.id = d.producto_id
@@ -2754,10 +3408,15 @@ class POSAbarrotes(QMainWindow):
             filas = c.fetchall()
 
         restaurados = []
-        for pid, codigo, nombre, cantidad, precio, costo, stock, activo in filas:
+        for (pid, codigo, nombre, cantidad, precio, costo, stock, activo,
+             es_granel, subtotal) in filas:
             if not activo or stock <= 0:
                 continue
+            recortado = cantidad > stock
             cantidad = min(cantidad, stock)
+            # El subtotal guardado respeta cobros por monto exacto; solo se
+            # recalcula si hubo que recortar la cantidad por falta de stock.
+            sub = precio * cantidad if recortado else (subtotal or precio * cantidad)
             restaurados.append({
                 "pid": pid,
                 "codigo": codigo,
@@ -2765,8 +3424,9 @@ class POSAbarrotes(QMainWindow):
                 "cant": cantidad,
                 "precio": precio,
                 "costo": costo,
-                "sub": precio * cantidad,
+                "sub": sub,
                 "stock": stock,
+                "es_granel": es_granel,
             })
 
         if restaurados:
@@ -2826,6 +3486,12 @@ class POSAbarrotes(QMainWindow):
         if pedir_corte:
             self._perrito_evento("corte")
         return True
+
+    def _cambiar_contrasena(self):
+        # Admin: puede resetear a cualquiera (el suyo pide la actual).
+        # Vendedor: solo la suya, pidiendo la actual.
+        modo = "admin" if self._es_admin else "voluntario"
+        DialogoCambioContrasena(self._usuario_actual, modo=modo, parent=self).exec()
 
     def _cerrar_sesion(self):
         if not self._confirmar_salida("cerrar sesión"):
@@ -3038,7 +3704,8 @@ class POSAbarrotes(QMainWindow):
         with conectar() as conn:
             c = conn.cursor()
             c.execute("""
-                SELECT id, codigo_barras, nombre, precio_venta, stock, precio_compra
+                SELECT id, codigo_barras, nombre, precio_venta, stock,
+                       precio_compra, COALESCE(es_granel, 0)
                 FROM productos
                 WHERE codigo_barras = ? AND activo = 1
             """, (codigo,))
@@ -3048,7 +3715,8 @@ class POSAbarrotes(QMainWindow):
         with conectar() as conn:
             c = conn.cursor()
             c.execute("""
-                SELECT id, codigo_barras, nombre, precio_venta, stock, precio_compra
+                SELECT id, codigo_barras, nombre, precio_venta, stock,
+                       precio_compra, COALESCE(es_granel, 0)
                 FROM productos
                 WHERE id = ? AND activo = 1
             """, (pid,))
@@ -3070,12 +3738,16 @@ class POSAbarrotes(QMainWindow):
         self._agregar_producto_al_ticket(prod)
 
     def _agregar_producto_al_ticket(self, prod):
-        pid, cod, nombre, precio, stock, costo = prod
+        pid, cod, nombre, precio, stock, costo, es_granel = prod
 
         if stock <= 0:
             QMessageBox.warning(self, "Sin existencia",
                                 f"«{nombre}» no tiene stock disponible.")
             self._enfocar_codigo_venta()
+            return
+
+        if es_granel:
+            self._agregar_granel_al_ticket(prod)
             return
 
         for item in self._ticket:
@@ -3101,10 +3773,51 @@ class POSAbarrotes(QMainWindow):
         self._ticket.append({
             "pid": pid, "codigo": cod, "nombre": nombre,
             "cant": 1, "precio": precio, "costo": costo,
-            "sub": precio, "stock": stock,
+            "sub": precio, "stock": stock, "es_granel": 0,
         })
         self._refrescar_ticket()
         self._statusbar.showMessage(f"«{nombre}» agregado al ticket.", 2500)
+        self._enfocar_codigo_venta()
+
+    def _agregar_granel_al_ticket(self, prod):
+        """Venta por peso: abre el diálogo de captura y suma el renglón.
+        El subtotal se ACUMULA (no se recalcula) para respetar los cobros
+        por monto exacto («dame $30»)."""
+        pid, cod, nombre, precio, stock, costo, _ = prod
+
+        ya_en_ticket = next(
+            (i for i in self._ticket if i["pid"] == pid), None)
+        peso_en_ticket = ya_en_ticket["cant"] if ya_en_ticket else 0.0
+        disponible = redondear_peso(stock - peso_en_ticket)
+        if disponible <= 0:
+            QMessageBox.warning(
+                self, "Stock insuficiente",
+                f"Ya tienes {formatear_cantidad(peso_en_ticket, True)} de "
+                f"«{nombre}» en el ticket; no queda más peso disponible.")
+            self._enfocar_codigo_venta()
+            return
+
+        dlg = DialogoVentaGranel(nombre, precio, disponible, self)
+        if dlg.exec() != QDialog.Accepted:
+            self._enfocar_codigo_venta()
+            return
+        d = dlg.resultado()
+
+        if ya_en_ticket:
+            ya_en_ticket["cant"] = redondear_peso(ya_en_ticket["cant"] + d["cantidad"])
+            ya_en_ticket["sub"] = round(ya_en_ticket["sub"] + d["subtotal"], 2)
+            ya_en_ticket["stock"] = stock
+            ya_en_ticket["costo"] = costo
+        else:
+            self._ticket.append({
+                "pid": pid, "codigo": cod, "nombre": nombre,
+                "cant": d["cantidad"], "precio": precio, "costo": costo,
+                "sub": d["subtotal"], "stock": stock, "es_granel": 1,
+            })
+        self._refrescar_ticket()
+        self._statusbar.showMessage(
+            f"«{nombre}» — {formatear_cantidad(d['cantidad'], True)} "
+            f"agregados al ticket.", 2500)
         self._enfocar_codigo_venta()
 
     def _cargar_productos_pos(self, *args):
@@ -3125,7 +3838,8 @@ class POSAbarrotes(QMainWindow):
             params.append(categoria)
 
         sql = f"""
-            SELECT id, codigo_barras, nombre, categoria, precio_venta, stock, stock_minimo
+            SELECT id, codigo_barras, nombre, categoria, precio_venta,
+                   stock, stock_minimo, COALESCE(es_granel, 0)
             FROM productos
             WHERE {' AND '.join(filtros)}
             ORDER BY categoria COLLATE NOCASE, nombre COLLATE NOCASE
@@ -3143,10 +3857,11 @@ class POSAbarrotes(QMainWindow):
         C_DARK = QColor("#1e1e2e")
 
         for fila, row in enumerate(rows):
-            pid, cod, nom, cat, precio, stock, minimo = row
+            pid, cod, nom, cat, precio, stock, minimo, es_granel = row
             vals = [
                 str(pid), codigo_visible(cod), nom, cat or "",
-                f"${precio:.2f}", str(stock),
+                f"${precio:.2f}{' /kg' if es_granel else ''}",
+                formatear_cantidad(stock, es_granel),
             ]
             for col, val in enumerate(vals):
                 cell = QTableWidgetItem(val)
@@ -3193,10 +3908,11 @@ class POSAbarrotes(QMainWindow):
         total = 0.0
         for fila, item in enumerate(self._ticket):
             total += item["sub"]
+            es_granel = item.get("es_granel", 0)
             vals = [
                 str(item["pid"]), codigo_visible(item["codigo"]), item["nombre"],
-                str(item["cant"]),
-                f"${item['precio']:.2f}",
+                formatear_cantidad(item["cant"], es_granel),
+                f"${item['precio']:.2f}{' /kg' if es_granel else ''}",
                 f"${item['sub']:.2f}",
             ]
             for col, val in enumerate(vals):
@@ -3228,6 +3944,11 @@ class POSAbarrotes(QMainWindow):
             self._enfocar_codigo_venta()
             return
 
+        if item.get("es_granel"):
+            # Para granel «+» vuelve a abrir la captura de peso/monto
+            self._agregar_granel_al_ticket(prod)
+            return
+
         stock_actual = prod[4]
         item["stock"] = stock_actual
         if item["cant"] >= stock_actual:
@@ -3246,7 +3967,11 @@ class POSAbarrotes(QMainWindow):
             self._enfocar_codigo_venta()
             return
         item = self._ticket[f]
-        if item["cant"] > 1:
+        if item.get("es_granel"):
+            # No hay «una pieza menos» en granel: se quita el renglón
+            # completo y se vuelve a capturar si hace falta.
+            self._ticket.pop(f)
+        elif item["cant"] > 1:
             item["cant"] -= 1
             item["sub"] = item["cant"] * item["precio"]
         else:
@@ -3309,10 +4034,12 @@ class POSAbarrotes(QMainWindow):
                     if not row or row[2] != 1:
                         raise ValueError(f"«{item['nombre']}» ya no está activo.")
                     nombre_actual, stock_actual, _activo, costo_actual = row
-                    if stock_actual < item["cant"]:
+                    if stock_actual + TOLERANCIA_PESO < item["cant"]:
+                        es_granel = item.get("es_granel", 0)
                         raise ValueError(
                             f"Stock insuficiente para «{nombre_actual}». "
-                            f"Disponible: {stock_actual}, en ticket: {item['cant']}."
+                            f"Disponible: {formatear_cantidad(stock_actual, es_granel)}, "
+                            f"en ticket: {formatear_cantidad(item['cant'], es_granel)}."
                         )
                     item["costo"] = costo_actual
 
@@ -3436,17 +4163,24 @@ class POSAbarrotes(QMainWindow):
         self._inp_venta.setPrefix("$")
         self._inp_venta.setDecimals(2)
 
-        self._inp_stock = CasillaEntero()
+        # Stock con decimales dinámicos: 0 decimales para pieza,
+        # 3 (gramos) cuando el producto es a granel.
+        self._inp_stock = CasillaPeso()
         self._inp_stock.setRange(0, 999_999)
 
-        self._inp_minimo = CasillaEntero()
+        self._inp_minimo = CasillaPeso()
         self._inp_minimo.setRange(0, 999_999)
         self._inp_minimo.setValue(5)
+
+        self._chk_granel = QCheckBox("A granel (precio por kg)")
+        self._chk_granel.toggled.connect(self._actualizar_modo_granel_form)
+        self._actualizar_modo_granel_form(False)
 
         # Fila 0
         grid.addWidget(QLabel("Código:"),       0, 0); grid.addWidget(self._inp_cod,    0, 1)
         grid.addWidget(QLabel("Nombre *:"),      0, 2); grid.addWidget(self._inp_nom,    0, 3)
         grid.addWidget(QLabel("Categoría:"),     0, 4); grid.addWidget(self._inp_cat,    0, 5)
+        grid.addWidget(self._chk_granel,         0, 6, 1, 2)
         # Fila 1
         grid.addWidget(QLabel("Precio compra:"), 1, 0); grid.addWidget(self._inp_compra, 1, 1)
         grid.addWidget(QLabel("Precio venta *:"),1, 2); grid.addWidget(self._inp_venta,  1, 3)
@@ -3606,6 +4340,14 @@ class POSAbarrotes(QMainWindow):
             venta_ant, venta_nueva, motivo, fecha,
         ))
 
+    def _actualizar_modo_granel_form(self, granel):
+        """Adapta el formulario: piezas enteras o kg con gramos."""
+        for casilla in (self._inp_stock, self._inp_minimo):
+            casilla.setDecimals(3 if granel else 0)
+            casilla.setSuffix(" kg" if granel else "")
+        for casilla in (self._inp_compra, self._inp_venta):
+            casilla.setSuffix(" /kg" if granel else "")
+
     def _guardar_producto(self):
         if not self._es_admin and self._pid_editando:
             QMessageBox.warning(
@@ -3620,8 +4362,13 @@ class POSAbarrotes(QMainWindow):
         cat = self._inp_cat.currentText().strip()
         compra = self._inp_compra.value()
         venta = self._inp_venta.value()
-        stock = self._inp_stock.value()
-        minimo = self._inp_minimo.value()
+        es_granel = 1 if self._chk_granel.isChecked() else 0
+        if es_granel:
+            stock = redondear_peso(self._inp_stock.value())
+            minimo = redondear_peso(self._inp_minimo.value())
+        else:
+            stock = int(self._inp_stock.value())
+            minimo = int(self._inp_minimo.value())
         fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         codigo_generado = False
 
@@ -3667,10 +4414,11 @@ class POSAbarrotes(QMainWindow):
                     c.execute("""
                         UPDATE productos SET
                             codigo_barras = ?, nombre = ?, categoria = ?,
-                            precio_compra = ?, precio_venta = ?, stock_minimo = ?
+                            precio_compra = ?, precio_venta = ?, stock_minimo = ?,
+                            es_granel = ?
                         WHERE id = ?
                     """, (codigo, nombre, cat, compra, venta, minimo,
-                          self._pid_editando))
+                          es_granel, self._pid_editando))
                     self._registrar_historial_precio(
                         c, self._pid_editando, compra_ant, compra,
                         venta_ant, venta, "Edición de producto", fecha
@@ -3683,9 +4431,10 @@ class POSAbarrotes(QMainWindow):
                     c.execute("""
                         INSERT INTO productos
                             (codigo_barras, nombre, categoria, precio_compra,
-                             precio_venta, stock, stock_minimo, fecha_alta)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (codigo, nombre, cat, compra, venta, stock, minimo, fecha))
+                             precio_venta, stock, stock_minimo, es_granel, fecha_alta)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (codigo, nombre, cat, compra, venta, stock, minimo,
+                          es_granel, fecha))
                     pid = c.lastrowid
                     self._registrar_historial_precio(
                         c, pid, 0, compra, 0, venta,
@@ -3753,7 +4502,8 @@ class POSAbarrotes(QMainWindow):
             c = conn.cursor()
             c.execute("""
                 SELECT id, codigo_barras, nombre, categoria,
-                       precio_compra, precio_venta, stock, stock_minimo
+                       precio_compra, precio_venta, stock, stock_minimo,
+                       COALESCE(es_granel, 0)
                 FROM productos WHERE id = ?
             """, (pid,))
             p = c.fetchone()
@@ -3768,6 +4518,7 @@ class POSAbarrotes(QMainWindow):
         self._inp_cat.setEditText(p[3] or "")
         self._inp_compra.setValue(p[4])
         self._inp_venta.setValue(p[5])
+        self._chk_granel.setChecked(bool(p[8]))
         self._inp_stock.setValue(p[6])
         self._inp_stock.setEnabled(False)   # usa el botón de ajuste para cambiar stock
         self._inp_minimo.setValue(p[7])
@@ -3794,6 +4545,7 @@ class POSAbarrotes(QMainWindow):
         self._inp_stock.setValue(0)
         self._inp_stock.setEnabled(True)
         self._inp_minimo.setValue(5)
+        self._chk_granel.setChecked(False)
         self._btn_guardar.setText("💾  Guardar Producto")
         self._btn_entrada.setEnabled(False)
         self._btn_desac.setEnabled(False)
@@ -3837,21 +4589,23 @@ class POSAbarrotes(QMainWindow):
 
         with conectar() as conn:
             c = conn.cursor()
-            c.execute("SELECT nombre, stock FROM productos WHERE id = ?",
+            c.execute("""SELECT nombre, stock, COALESCE(es_granel, 0)
+                         FROM productos WHERE id = ?""",
                       (self._pid_editando,))
-            nombre, stock_actual = c.fetchone()
+            nombre, stock_actual, es_granel = c.fetchone()
 
-        dlg = DialogoAjusteStock(nombre, stock_actual, self)
+        dlg = DialogoAjusteStock(nombre, stock_actual, bool(es_granel), self)
         if dlg.exec() != QDialog.Accepted:
             return
 
         d = dlg.resultado()
         fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        if d["tipo"] == "SALIDA" and d["cantidad"] > stock_actual:
+        if d["tipo"] == "SALIDA" and d["cantidad"] > stock_actual + TOLERANCIA_PESO:
             QMessageBox.warning(
                 self, "Stock insuficiente",
-                f"Solo hay {stock_actual} unidades disponibles de «{nombre}»."
+                f"Solo hay {formatear_cantidad(stock_actual, es_granel)} "
+                f"disponibles de «{nombre}»."
             )
             return
 
@@ -3877,7 +4631,9 @@ class POSAbarrotes(QMainWindow):
         self._cargar_productos()
         self._cargar_productos_pos()
         self._statusbar.showMessage(
-            f"Stock de «{nombre}» ajustado — {d['tipo']}: {d['cantidad']} uds.", 4000
+            f"Stock de «{nombre}» ajustado — {d['tipo']}: "
+            f"{formatear_cantidad(d['cantidad'], es_granel)}"
+            f"{'' if es_granel else ' uds.'}", 4000
         )
 
     def _agregar_existencias(self):
@@ -3888,7 +4644,8 @@ class POSAbarrotes(QMainWindow):
         with conectar() as conn:
             c = conn.cursor()
             c.execute("""
-                SELECT nombre, stock, precio_compra, precio_venta, activo
+                SELECT nombre, stock, precio_compra, precio_venta, activo,
+                       COALESCE(es_granel, 0)
                 FROM productos
                 WHERE id = ?
             """, (pid,))
@@ -3899,14 +4656,15 @@ class POSAbarrotes(QMainWindow):
                                 "No se pudo encontrar el producto seleccionado.")
             return
 
-        nombre, stock_actual, compra_actual, venta_actual, activo = row
+        nombre, stock_actual, compra_actual, venta_actual, activo, es_granel = row
         if not activo:
             QMessageBox.warning(self, "Producto inactivo",
                                 "No se puede añadir stock a un producto inactivo.")
             return
 
         dlg = DialogoEntradaInventario(
-            nombre, stock_actual, compra_actual, venta_actual, self
+            nombre, stock_actual, compra_actual, venta_actual,
+            bool(es_granel), self
         )
         if dlg.exec() != QDialog.Accepted:
             return
@@ -3956,12 +4714,14 @@ class POSAbarrotes(QMainWindow):
             self._limpiar_form_inv()
         elif not self._es_admin:
             self._btn_entrada.setEnabled(False)
+        cantidad_txt = (formatear_cantidad(d["cantidad"], True) if es_granel
+                        else f"{d['cantidad']} unidades")
         self._statusbar.showMessage(
-            f"Entrada guardada: «{nombre}» +{d['cantidad']} uds.", 5000
+            f"Entrada guardada: «{nombre}» +{cantidad_txt}", 5000
         )
         QMessageBox.information(
             self, "Inventario añadido",
-            f"Se añadieron {d['cantidad']} unidades a «{nombre}»."
+            f"Se añadieron {cantidad_txt} a «{nombre}»."
         )
 
     def _cambiar_precios(self):
@@ -4070,7 +4830,8 @@ class POSAbarrotes(QMainWindow):
             c = conn.cursor()
             c.execute(f"""
                 SELECT id, codigo_barras, nombre, categoria,
-                       precio_compra, precio_venta, stock, stock_minimo, activo
+                       precio_compra, precio_venta, stock, stock_minimo, activo,
+                       COALESCE(es_granel, 0)
                 FROM productos
                 {where}
                 ORDER BY nombre COLLATE NOCASE
@@ -4083,12 +4844,14 @@ class POSAbarrotes(QMainWindow):
         C_DARK = QColor("#1e1e2e")
 
         for fila, row in enumerate(rows):
-            pid, cod, nom, cat, compra, venta, stock, minimo, activo = row
+            pid, cod, nom, cat, compra, venta, stock, minimo, activo, es_granel = row
             estado = "✅ Activo" if activo else "🚫 Inactivo"
+            sufijo_kg = " /kg" if es_granel else ""
             vals = [
                 str(pid), codigo_visible(cod), nom, cat or "",
-                f"${compra:.2f}", f"${venta:.2f}",
-                str(stock), str(minimo), estado,
+                f"${compra:.2f}{sufijo_kg}", f"${venta:.2f}{sufijo_kg}",
+                formatear_cantidad(stock, es_granel),
+                formatear_cantidad(minimo, es_granel), estado,
             ]
             for col, val in enumerate(vals):
                 cell = QTableWidgetItem(val)
@@ -5123,7 +5886,8 @@ class POSAbarrotes(QMainWindow):
         with conectar() as conn:
             c = conn.cursor()
             c.execute(f"""
-                SELECT id, codigo_barras, nombre, categoria, precio_venta, stock, stock_minimo
+                SELECT id, codigo_barras, nombre, categoria, precio_venta,
+                       stock, stock_minimo, COALESCE(es_granel, 0)
                 FROM productos
                 WHERE {' AND '.join(filtros)}
                 ORDER BY categoria COLLATE NOCASE, nombre COLLATE NOCASE
@@ -5135,10 +5899,11 @@ class POSAbarrotes(QMainWindow):
         C_ROJO = QColor("#f38ba8")
         C_AMAR = QColor("#f9e2af")
         C_DARK = QColor("#1e1e2e")
-        for fila, (pid, cod, nom, cat, precio, stock, minimo) in enumerate(rows):
+        for fila, (pid, cod, nom, cat, precio, stock, minimo, es_granel) in enumerate(rows):
             vals = [
                 str(pid), codigo_visible(cod), nom, cat or "",
-                f"${precio:.2f}", str(stock),
+                f"${precio:.2f}{' /kg' if es_granel else ''}",
+                formatear_cantidad(stock, es_granel),
             ]
             for col, val in enumerate(vals):
                 cell = QTableWidgetItem(val)
@@ -5185,11 +5950,52 @@ class POSAbarrotes(QMainWindow):
         self._tabla_busqueda_prest.clearSelection()
 
     def _prestamo_agregar_producto(self, prod):
-        pid, cod, nombre, precio, stock, costo = prod
+        pid, cod, nombre, precio, stock, costo, es_granel = prod
 
         if stock <= 0:
             QMessageBox.warning(self, "Sin existencia",
                                 f"«{nombre}» no tiene stock disponible.")
+            self._enfocar_codigo_prestamo()
+            return
+
+        if es_granel:
+            ya_en_lineas = next(
+                (i for i in self._prestamo_lineas if i["pid"] == pid), None)
+            peso_en_lineas = ya_en_lineas["cant"] if ya_en_lineas else 0.0
+            disponible = redondear_peso(stock - peso_en_lineas)
+            if disponible <= 0:
+                QMessageBox.warning(
+                    self, "Stock insuficiente",
+                    f"Ya tienes {formatear_cantidad(peso_en_lineas, True)} de "
+                    f"«{nombre}» en el préstamo; no queda más peso disponible.")
+                self._enfocar_codigo_prestamo()
+                return
+            dlg = DialogoVentaGranel(nombre, precio, disponible, self)
+            if dlg.exec() != QDialog.Accepted:
+                self._enfocar_codigo_prestamo()
+                return
+            d = dlg.resultado()
+            # En préstamos el valor del renglón es SIEMPRE peso × precio:
+            # detalle_prestamos no guarda subtotal y el cobro futuro se
+            # calcula así — mostrar el monto capturado engañaría al fiado.
+            if ya_en_lineas:
+                ya_en_lineas["cant"] = redondear_peso(
+                    ya_en_lineas["cant"] + d["cantidad"])
+                ya_en_lineas["sub"] = round(
+                    ya_en_lineas["cant"] * precio, 2)
+                ya_en_lineas["stock"] = stock
+                ya_en_lineas["costo"] = costo
+            else:
+                self._prestamo_lineas.append({
+                    "pid": pid, "codigo": cod, "nombre": nombre,
+                    "cant": d["cantidad"], "precio": precio, "costo": costo,
+                    "sub": round(d["cantidad"] * precio, 2),
+                    "stock": stock, "es_granel": 1,
+                })
+            self._refrescar_lineas_prestamo()
+            self._statusbar.showMessage(
+                f"«{nombre}» — {formatear_cantidad(d['cantidad'], True)} "
+                f"al préstamo.", 2500)
             self._enfocar_codigo_prestamo()
             return
 
@@ -5213,7 +6019,7 @@ class POSAbarrotes(QMainWindow):
         self._prestamo_lineas.append({
             "pid": pid, "codigo": cod, "nombre": nombre,
             "cant": 1, "precio": precio, "costo": costo,
-            "sub": precio, "stock": stock,
+            "sub": precio, "stock": stock, "es_granel": 0,
         })
         self._refrescar_lineas_prestamo()
         self._statusbar.showMessage(f"«{nombre}» agregado al préstamo.", 2500)
@@ -5224,9 +6030,12 @@ class POSAbarrotes(QMainWindow):
         total = 0.0
         for fila, item in enumerate(self._prestamo_lineas):
             total += item["sub"]
+            es_granel = item.get("es_granel", 0)
             vals = [
                 str(item["pid"]), codigo_visible(item["codigo"]), item["nombre"],
-                str(item["cant"]), f"${item['precio']:.2f}", f"${item['sub']:.2f}",
+                formatear_cantidad(item["cant"], es_granel),
+                f"${item['precio']:.2f}{' /kg' if es_granel else ''}",
+                f"${item['sub']:.2f}",
             ]
             for col, val in enumerate(vals):
                 cell = QTableWidgetItem(val)
@@ -5251,6 +6060,10 @@ class POSAbarrotes(QMainWindow):
             QMessageBox.warning(self, "Producto no disponible",
                                 "El producto ya no está activo en inventario.")
             return
+        if item.get("es_granel"):
+            # Para granel «+» vuelve a abrir la captura de peso/monto
+            self._prestamo_agregar_producto(prod)
+            return
         stock_actual = prod[4]
         item["stock"] = stock_actual
         if item["cant"] >= stock_actual:
@@ -5266,7 +6079,10 @@ class POSAbarrotes(QMainWindow):
         if f < 0:
             return
         item = self._prestamo_lineas[f]
-        if item["cant"] > 1:
+        if item.get("es_granel"):
+            # Sin «una pieza menos» en granel: se quita el renglón completo
+            self._prestamo_lineas.pop(f)
+        elif item["cant"] > 1:
             item["cant"] -= 1
             item["sub"] = item["cant"] * item["precio"]
         else:
@@ -5432,10 +6248,12 @@ class POSAbarrotes(QMainWindow):
             if not row or row[2] != 1:
                 raise ValueError(f"«{item['nombre']}» ya no está activo.")
             nombre_actual, stock_actual, _activo, costo_actual = row
-            if stock_actual < item["cant"]:
+            if stock_actual + TOLERANCIA_PESO < item["cant"]:
+                es_granel = item.get("es_granel", 0)
                 raise ValueError(
                     f"Stock insuficiente para «{nombre_actual}». "
-                    f"Disponible: {stock_actual}, en préstamo: {item['cant']}."
+                    f"Disponible: {formatear_cantidad(stock_actual, es_granel)}, "
+                    f"en préstamo: {formatear_cantidad(item['cant'], es_granel)}."
                 )
             item["costo"] = costo_actual
 
@@ -5461,7 +6279,8 @@ class POSAbarrotes(QMainWindow):
                   f"Préstamo #{prestamo_id}", fecha))
 
         return ", ".join(
-            f"{i['nombre']} x{i['cant']}" for i in self._prestamo_lineas
+            f"{i['nombre']} x{formatear_cantidad(i['cant'], i.get('es_granel', 0))}"
+            for i in self._prestamo_lineas
         )
 
     def _registrar_prestamo(self):
@@ -5572,8 +6391,11 @@ class POSAbarrotes(QMainWindow):
         self._tabla_prestamos.setRowCount(len(filas))
         for fila, (pid, fecha, cliente, tel, articulos, pendiente, estado_p, vendedor) in enumerate(filas):
             fecha_txt, _hora = separar_fecha_hora(fecha)
+            # La suma puede mezclar piezas y kg: entero si cuadra, si no 3 dec.
+            articulos_txt = (str(int(articulos)) if articulos == int(articulos)
+                             else f"{articulos:.3f}")
             valores = [
-                str(pid), fecha_txt, cliente, tel, str(articulos),
+                str(pid), fecha_txt, cliente, tel, articulos_txt,
                 f"${pendiente:.2f}", estado_p, vendedor,
             ]
             for col, val in enumerate(valores):
@@ -5930,8 +6752,12 @@ class POSAbarrotes(QMainWindow):
         self._combo_producto_compra = QComboBox()
         self._combo_producto_compra.currentIndexChanged.connect(self._cargar_precio_producto_compra)
 
-        self._spin_compra_cantidad = CasillaEntero()
-        self._spin_compra_cantidad.setRange(1, 999_999)
+        # Decimales dinámicos: piezas enteras o kg (según el producto)
+        self._spin_compra_cantidad = CasillaPeso()
+        self._spin_compra_cantidad.setRange(0.001, 999_999)
+        self._spin_compra_cantidad.setDecimals(0)
+        self._spin_compra_cantidad.setSuffix("")
+        self._compra_es_granel = False
 
         self._spin_compra_costo = CasillaMonto()
         self._spin_compra_costo.setRange(0, 999_999)
@@ -6082,7 +6908,7 @@ class POSAbarrotes(QMainWindow):
         with conectar() as conn:
             c = conn.cursor()
             c.execute("""
-                SELECT precio_compra, precio_venta
+                SELECT precio_compra, precio_venta, COALESCE(es_granel, 0)
                 FROM productos
                 WHERE id = ?
             """, (pid,))
@@ -6090,6 +6916,12 @@ class POSAbarrotes(QMainWindow):
         if row:
             self._spin_compra_costo.setValue(row[0])
             self._spin_compra_venta.setValue(row[1])
+            self._compra_es_granel = bool(row[2])
+            self._spin_compra_cantidad.setDecimals(3 if row[2] else 0)
+            self._spin_compra_cantidad.setSuffix(" kg" if row[2] else "")
+            sufijo_kg = " /kg" if row[2] else ""
+            self._spin_compra_costo.setSuffix(sufijo_kg)
+            self._spin_compra_venta.setSuffix(sufijo_kg)
 
     def _agregar_linea_compra(self):
         producto_id = self._combo_producto_compra.currentData()
@@ -6098,6 +6930,14 @@ class POSAbarrotes(QMainWindow):
                                 "Selecciona un producto para la compra.")
             return
         cantidad = self._spin_compra_cantidad.value()
+        if self._compra_es_granel:
+            cantidad = redondear_peso(cantidad)
+        else:
+            cantidad = int(cantidad)
+        if cantidad <= 0:
+            QMessageBox.warning(self, "Cantidad inválida",
+                                "La cantidad debe ser mayor a cero.")
+            return
         costo = self._spin_compra_costo.value()
         venta = self._spin_compra_venta.value()
         if costo <= 0:
@@ -6116,7 +6956,8 @@ class POSAbarrotes(QMainWindow):
             "cantidad": cantidad,
             "costo": costo,
             "venta": venta,
-            "subtotal": cantidad * costo,
+            "subtotal": round(cantidad * costo, 2),
+            "es_granel": self._compra_es_granel,
         })
         self._refrescar_lineas_compra()
 
@@ -6126,7 +6967,8 @@ class POSAbarrotes(QMainWindow):
         self._tabla_lineas_compra.setRowCount(len(self._lineas_compra))
         for fila, linea in enumerate(self._lineas_compra):
             valores = [
-                linea["producto"], str(linea["cantidad"]),
+                linea["producto"],
+                formatear_cantidad(linea["cantidad"], linea.get("es_granel", False)),
                 f"${linea['costo']:.2f}", f"${linea['venta']:.2f}",
                 f"${linea['subtotal']:.2f}", str(linea["producto_id"]),
             ]
@@ -6277,8 +7119,15 @@ class POSAbarrotes(QMainWindow):
         btn_ver = QPushButton("🔍  Actualizar")
         btn_ver.clicked.connect(self._cargar_reportes_fuertes)
 
+        self._btn_exportar_csv = QPushButton("📄  Exportar CSV")
+        self._btn_exportar_csv.clicked.connect(self._exportar_reporte_csv)
+        self._btn_exportar_pdf = QPushButton("🖨️  Exportar PDF")
+        self._btn_exportar_pdf.clicked.connect(self._exportar_reporte_pdf)
+
         hl.addWidget(btn_mes)
         hl.addWidget(btn_ver)
+        hl.addWidget(self._btn_exportar_csv)
+        hl.addWidget(self._btn_exportar_pdf)
         hl.addStretch()
         root.addLayout(hl)
 
@@ -6319,6 +7168,8 @@ class POSAbarrotes(QMainWindow):
             "Valor pendiente", "Vendedor"
         ])
 
+        self._tabs_reportes_fuertes.addTab(self._crear_subtab_comparativa(), "Comparativa")
+        self._tabs_reportes_fuertes.addTab(self._crear_subtab_graficas(), "Gráficas")
         self._tabs_reportes_fuertes.addTab(self._tabla_top_vendidos, "Top vendidos")
         self._tabs_reportes_fuertes.addTab(self._tabla_top_ganancia, "Más ganancia")
         self._tabs_reportes_fuertes.addTab(self._tabla_baja_rotacion, "Baja rotación")
@@ -6330,6 +7181,10 @@ class POSAbarrotes(QMainWindow):
         self._tabs_reportes_fuertes.addTab(self._tabla_rep_cortes, "Cortes de caja")
         self._tabs_reportes_fuertes.addTab(self._tabla_rep_prestamos_pend, "Préstamos pendientes")
         root.addWidget(self._tabs_reportes_fuertes)
+
+        self._tabs_reportes_fuertes.currentChanged.connect(
+            self._actualizar_botones_exportar)
+        self._actualizar_botones_exportar()
 
         return w
 
@@ -6350,6 +7205,355 @@ class POSAbarrotes(QMainWindow):
                 cell.setTextAlignment(Qt.AlignCenter)
                 tabla.setItem(fila, col, cell)
 
+    # ── exportación de reportes (CSV / PDF) ────────────────
+
+    def _reporte_visible(self):
+        """(título, tabla) del sub-reporte visible, o (título, None) si la
+        pestaña actual no tiene tabla exportable (p. ej. Gráficas)."""
+        tabs = self._tabs_reportes_fuertes
+        w = tabs.currentWidget()
+        if w is None:
+            return "", None
+        tabla = w if isinstance(w, QTableWidget) else w.findChild(QTableWidget)
+        return tabs.tabText(tabs.currentIndex()), tabla
+
+    def _actualizar_botones_exportar(self):
+        _, tabla = self._reporte_visible()
+        hay_tabla = tabla is not None
+        self._btn_exportar_csv.setEnabled(hay_tabla)
+        self._btn_exportar_pdf.setEnabled(hay_tabla)
+
+    def _datos_reporte_visible(self):
+        """Título, rango legible, columnas y filas de la tabla visible,
+        tal como se ve en pantalla."""
+        titulo, tabla = self._reporte_visible()
+        if tabla is None:
+            return None
+        columnas = [tabla.horizontalHeaderItem(c).text()
+                    for c in range(tabla.columnCount())]
+        filas = []
+        for f in range(tabla.rowCount()):
+            filas.append([
+                tabla.item(f, c).text() if tabla.item(f, c) else ""
+                for c in range(tabla.columnCount())
+            ])
+        inicio = self._date_rep_inicio.date().toString("dd/MM/yyyy")
+        fin = self._date_rep_fin.date().toString("dd/MM/yyyy")
+        return titulo, f"Del {inicio} al {fin}", columnas, filas
+
+    def _ruta_sugerida_reporte(self, titulo, extension):
+        inicio = self._date_rep_inicio.date().toString("yyyy-MM-dd")
+        fin = self._date_rep_fin.date().toString("yyyy-MM-dd")
+        limpio = re.sub(r"[^\w\s-]", "", titulo).strip().replace(" ", "-").lower()
+        return str(Path.home() / f"reporte-{limpio}-{inicio}-a-{fin}.{extension}")
+
+    def _exportar_reporte_csv(self):
+        datos = self._datos_reporte_visible()
+        if not datos:
+            return
+        titulo, _rango, columnas, filas = datos
+        ruta, _ = QFileDialog.getSaveFileName(
+            self, "Guardar reporte CSV",
+            self._ruta_sugerida_reporte(titulo, "csv"),
+            "Archivo CSV (*.csv)")
+        if not ruta:
+            return
+        try:
+            exportar_tabla_csv(ruta, columnas, filas)
+        except OSError as e:
+            QMessageBox.warning(
+                self, "No se pudo exportar",
+                "No se pudo guardar el archivo. Revisa que no esté abierto\n"
+                f"en otro programa y que la carpeta exista.\n\nDetalle: {e}")
+            return
+        QMessageBox.information(self, "Reporte exportado",
+                                f"El reporte se guardó en:\n{ruta}")
+
+    def _exportar_reporte_pdf(self):
+        datos = self._datos_reporte_visible()
+        if not datos:
+            return
+        titulo, rango, columnas, filas = datos
+        ruta, _ = QFileDialog.getSaveFileName(
+            self, "Guardar reporte PDF",
+            self._ruta_sugerida_reporte(titulo, "pdf"),
+            "Archivo PDF (*.pdf)")
+        if not ruta:
+            return
+        try:
+            escritor = QPdfWriter(ruta)
+            escritor.setPageLayout(QPageLayout(
+                QPageSize(QPageSize.A4), QPageLayout.Landscape,
+                QMarginsF(12, 12, 12, 12), QPageLayout.Millimeter))
+            escritor.setResolution(96)
+            documento = QTextDocument()
+            documento.setHtml(tabla_a_html(titulo, rango, columnas, filas))
+            documento.print_(escritor)
+            # Qt no lanza excepción si no pudo escribir (p. ej. archivo
+            # abierto en un visor): verificar que el PDF exista de verdad.
+            if not Path(ruta).exists() or Path(ruta).stat().st_size == 0:
+                raise OSError("el archivo no se pudo escribir")
+        except OSError as e:
+            QMessageBox.warning(
+                self, "No se pudo exportar",
+                "No se pudo guardar el archivo. Revisa que no esté abierto\n"
+                f"en otro programa y que la carpeta exista.\n\nDetalle: {e}")
+            return
+        QMessageBox.information(self, "Reporte exportado",
+                                f"El reporte se guardó en:\n{ruta}")
+
+    # ── sub-pestaña Comparativa ────────────────────────────
+
+    def _crear_subtab_comparativa(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setSpacing(8)
+
+        hl = QHBoxLayout()
+        btn_semana = QPushButton("📅  Esta semana vs pasada")
+        btn_semana.clicked.connect(self._comparar_semana_actual)
+        btn_mes = QPushButton("📅  Este mes vs pasado")
+        btn_mes.clicked.connect(self._comparar_mes_actual)
+        hl.addWidget(btn_semana)
+        hl.addWidget(btn_mes)
+        hl.addStretch()
+        lay.addLayout(hl)
+
+        self._lbl_comparativa = QLabel("")
+        lay.addWidget(self._lbl_comparativa)
+
+        self._tabla_comparativa = self._crear_tabla_simple([
+            "Métrica", "Periodo actual", "Periodo anterior",
+            "Diferencia", "Cambio %",
+        ])
+        lay.addWidget(self._tabla_comparativa)
+        return w
+
+    def _comparar_semana_actual(self):
+        inicio, fin = rango_semana()
+        self._date_rep_inicio.setDate(QDate.fromString(inicio, "yyyy-MM-dd"))
+        self._date_rep_fin.setDate(QDate.fromString(fin, "yyyy-MM-dd"))
+        self._cargar_reportes_fuertes()
+
+    def _comparar_mes_actual(self):
+        inicio, fin = rango_mes()
+        self._date_rep_inicio.setDate(QDate.fromString(inicio, "yyyy-MM-dd"))
+        self._date_rep_fin.setDate(QDate.fromString(fin, "yyyy-MM-dd"))
+        self._cargar_reportes_fuertes()
+
+    def _modo_comparacion(self, inicio, fin):
+        # Un mes calendario completo se compara contra el mes anterior
+        # (los meses no miden lo mismo); cualquier otro rango, contra los
+        # mismos días inmediatos anteriores.
+        d_inicio = datetime.strptime(inicio, "%Y-%m-%d").date()
+        return "mes" if (inicio, fin) == rango_mes(d_inicio) else "libre"
+
+    def _cargar_comparativa(self, inicio, fin):
+        modo = self._modo_comparacion(inicio, fin)
+        comp = comparar_periodos(inicio, fin, modo)
+        inicio_ant, fin_ant = comp["anterior"]
+
+        def legible(fecha):
+            return datetime.strptime(fecha, "%Y-%m-%d").strftime("%d/%m/%Y")
+
+        self._lbl_comparativa.setText(
+            f"Comparando  {legible(inicio)} – {legible(fin)}  contra  "
+            f"{legible(inicio_ant)} – {legible(fin_ant)}"
+            + ("  (mes calendario)" if modo == "mes" else "")
+        )
+
+        filas = []
+        for etiqueta, actual, anterior, dif, pct in comp["filas"]:
+            if etiqueta == "Número de ventas":
+                txt_actual, txt_anterior = str(int(actual)), str(int(anterior))
+                txt_dif = f"{int(dif):+d}"
+            else:
+                txt_actual = f"${actual:,.2f}"
+                txt_anterior = f"${anterior:,.2f}"
+                txt_dif = f"${dif:+,.2f}"
+            txt_pct = "—" if pct is None else f"{pct:+.1f}%"
+            filas.append([etiqueta, txt_actual, txt_anterior, txt_dif, txt_pct])
+        self._set_tabla(self._tabla_comparativa, filas)
+
+        # Diferencia y % en verde si subió, rojo si bajó
+        for f, (_etiqueta, _a, _b, dif, _pct) in enumerate(comp["filas"]):
+            if dif == 0:
+                continue
+            color = QColor("#a6e3a1") if dif > 0 else QColor("#f38ba8")
+            for c in (3, 4):
+                item = self._tabla_comparativa.item(f, c)
+                if item:
+                    item.setForeground(color)
+
+    # ── sub-pestaña Gráficas ───────────────────────────────
+
+    def _crear_subtab_graficas(self):
+        w = QWidget()
+        malla = QGridLayout(w)
+        malla.setSpacing(8)
+        self._vista_graf_dias = QChartView()
+        self._vista_graf_horas = QChartView()
+        self._vista_graf_categorias = QChartView()
+        self._vista_graf_tendencia = QChartView()
+        vistas = (self._vista_graf_dias, self._vista_graf_horas,
+                  self._vista_graf_categorias, self._vista_graf_tendencia)
+        for i, vista in enumerate(vistas):
+            vista.setRenderHint(QPainter.Antialiasing)
+            malla.addWidget(vista, i // 2, i % 2)
+        return w
+
+    def _grafica_nueva(self, titulo, con_leyenda=False):
+        chart = QChart()
+        chart.setTitle(titulo)
+        chart.setTitleBrush(QColor("#89b4fa"))
+        chart.setBackgroundBrush(QColor("#1e1e2e"))
+        chart.setBackgroundRoundness(0)
+        chart.legend().setVisible(con_leyenda)
+        if con_leyenda:
+            chart.legend().setLabelColor(QColor("#cdd6f4"))
+            chart.legend().setAlignment(Qt.AlignBottom)
+        return chart
+
+    def _estilizar_eje(self, eje):
+        eje.setLabelsColor(QColor("#a6adc8"))
+        eje.setGridLineColor(QColor("#45475a"))
+        return eje
+
+    def _poner_grafica(self, vista, chart):
+        anterior = vista.chart()
+        vista.setChart(chart)
+        if anterior is not None:
+            anterior.deleteLater()
+
+    def _ajustar_eje_valores(self, eje, valores):
+        # applyNiceNumbers con todos los valores en 0 (rango 0–0) genera
+        # avisos NaN de QtCharts; en ese caso se fija un rango simple.
+        if any(valores):
+            eje.applyNiceNumbers()
+        else:
+            eje.setRange(0, 1)
+
+    def _cargar_graficas(self, inicio, fin):
+        azul = QColor("#89b4fa")
+        fondo = QColor("#1e1e2e")
+
+        # ── Ventas por día (barras) ─────────────────────────
+        datos_dias = ventas_por_dia(inicio, fin)
+        mismo_anio = inicio[:4] == fin[:4]
+        formato_dia = "%d/%m" if mismo_anio else "%d/%m/%y"
+        chart = self._grafica_nueva("Ventas por día")
+        conjunto = QBarSet("Venta")
+        conjunto.setColor(azul)
+        conjunto.setBorderColor(fondo)
+        etiquetas = []
+        for dia, total in datos_dias:
+            conjunto.append(float(total))
+            etiquetas.append(
+                datetime.strptime(dia, "%Y-%m-%d").strftime(formato_dia))
+        serie = QBarSeries()
+        serie.append(conjunto)
+        chart.addSeries(serie)
+        eje_x = self._estilizar_eje(QBarCategoryAxis())
+        eje_x.append(etiquetas)
+        if len(etiquetas) > 14:
+            eje_x.setLabelsAngle(-90)
+        eje_y = self._estilizar_eje(QValueAxis())
+        eje_y.setLabelFormat("$%.0f")
+        chart.addAxis(eje_x, Qt.AlignBottom)
+        chart.addAxis(eje_y, Qt.AlignLeft)
+        serie.attachAxis(eje_x)
+        serie.attachAxis(eje_y)
+        self._ajustar_eje_valores(eje_y, [total for _dia, total in datos_dias])
+        self._poner_grafica(self._vista_graf_dias, chart)
+
+        # ── Ventas por hora (barras) ────────────────────────
+        datos_horas = ventas_por_hora_rango(inicio, fin)
+        chart = self._grafica_nueva("Ventas por hora")
+        conjunto = QBarSet("Venta")
+        conjunto.setColor(azul)
+        conjunto.setBorderColor(fondo)
+        for _hora, _num, total in datos_horas:
+            conjunto.append(float(total))
+        serie = QBarSeries()
+        serie.append(conjunto)
+        chart.addSeries(serie)
+        eje_x = self._estilizar_eje(QBarCategoryAxis())
+        eje_x.append([f"{h:02d}" for h, _n, _t in datos_horas])
+        eje_y = self._estilizar_eje(QValueAxis())
+        eje_y.setLabelFormat("$%.0f")
+        chart.addAxis(eje_x, Qt.AlignBottom)
+        chart.addAxis(eje_y, Qt.AlignLeft)
+        serie.attachAxis(eje_x)
+        serie.attachAxis(eje_y)
+        self._ajustar_eje_valores(
+            eje_y, [total for _h, _n, total in datos_horas])
+        self._poner_grafica(self._vista_graf_horas, chart)
+
+        # ── Ganancia por categoría (barras horizontales) ────
+        datos_cat = ganancia_por_categoria_rango(inicio, fin)[:10]
+        datos_cat.reverse()          # la mayor ganancia queda arriba
+        if not datos_cat:
+            datos_cat = [("Sin ventas", 0)]   # QBarSet vacío hace ruido NaN
+        chart = self._grafica_nueva("Ganancia por categoría (top 10)")
+        conjunto = QBarSet("Ganancia")
+        conjunto.setColor(azul)
+        conjunto.setBorderColor(fondo)
+        for _categoria, ganancia in datos_cat:
+            conjunto.append(float(ganancia))
+        serie = QHorizontalBarSeries()
+        serie.append(conjunto)
+        chart.addSeries(serie)
+        eje_y = self._estilizar_eje(QBarCategoryAxis())
+        eje_y.append([categoria for categoria, _g in datos_cat])
+        eje_x = self._estilizar_eje(QValueAxis())
+        eje_x.setLabelFormat("$%.0f")
+        chart.addAxis(eje_y, Qt.AlignLeft)
+        chart.addAxis(eje_x, Qt.AlignBottom)
+        serie.attachAxis(eje_y)
+        serie.attachAxis(eje_x)
+        self._ajustar_eje_valores(
+            eje_x, [ganancia for _c, ganancia in datos_cat])
+        self._poner_grafica(self._vista_graf_categorias, chart)
+
+        # ── Tendencia: periodo actual vs anterior (líneas) ──
+        inicio_ant, fin_ant = periodo_anterior(
+            inicio, fin, self._modo_comparacion(inicio, fin))
+        datos_actual = ventas_por_dia(inicio, fin)
+        datos_anterior = ventas_por_dia(inicio_ant, fin_ant)
+        chart = self._grafica_nueva("Tendencia de venta diaria", con_leyenda=True)
+
+        serie_actual = QLineSeries()
+        serie_actual.setName("Periodo actual")
+        serie_actual.setPen(QPen(azul, 2))
+        for i, (_dia, total) in enumerate(datos_actual, start=1):
+            serie_actual.append(i, float(total))
+
+        serie_anterior = QLineSeries()
+        serie_anterior.setName("Periodo anterior")
+        pluma = QPen(QColor("#a6adc8"), 2)
+        pluma.setStyle(Qt.DashLine)     # distinguible también sin color
+        serie_anterior.setPen(pluma)
+        for i, (_dia, total) in enumerate(datos_anterior, start=1):
+            serie_anterior.append(i, float(total))
+
+        chart.addSeries(serie_anterior)
+        chart.addSeries(serie_actual)
+        eje_x = self._estilizar_eje(QValueAxis())
+        eje_x.setTitleText("Día del periodo")
+        eje_x.setTitleBrush(QColor("#a6adc8"))
+        eje_x.setLabelFormat("%d")
+        eje_x.setRange(1, max(len(datos_actual), len(datos_anterior), 2))
+        eje_y = self._estilizar_eje(QValueAxis())
+        eje_y.setLabelFormat("$%.0f")
+        chart.addAxis(eje_x, Qt.AlignBottom)
+        chart.addAxis(eje_y, Qt.AlignLeft)
+        for serie in (serie_anterior, serie_actual):
+            serie.attachAxis(eje_x)
+            serie.attachAxis(eje_y)
+        self._ajustar_eje_valores(
+            eje_y, [total for _d, total in datos_actual + datos_anterior])
+        self._poner_grafica(self._vista_graf_tendencia, chart)
+
     def _cargar_reportes_fuertes(self):
         if not self._es_admin or not hasattr(self, "_date_rep_inicio"):
             return
@@ -6365,6 +7569,11 @@ class POSAbarrotes(QMainWindow):
         fin = fin_q.toString("yyyy-MM-dd")
         desde = f"{inicio} 00:00:00"
         hasta = f"{fin} 23:59:59"
+
+        # Antes de las tablas: más abajo el bucle de cortes reutiliza los
+        # nombres `inicio`/`fin` y dejaría el rango con hora incluida.
+        self._cargar_comparativa(inicio, fin)
+        self._cargar_graficas(inicio, fin)
 
         with conectar() as conn:
             c = conn.cursor()
@@ -6627,15 +7836,18 @@ class POSAbarrotes(QMainWindow):
             prestamos_pendientes = c.fetchall()
 
         self._set_tabla(self._tabla_top_vendidos, [
-            [n, cat, cant, f"${venta:.2f}", f"${ganancia:.2f}"]
+            [n, cat, formatear_cantidad_mixta(cant),
+             f"${venta:.2f}", f"${ganancia:.2f}"]
             for n, cat, cant, venta, ganancia in top_vendidos
         ])
         self._set_tabla(self._tabla_top_ganancia, [
-            [n, cat, cant, f"${venta:.2f}", f"${ganancia:.2f}"]
+            [n, cat, formatear_cantidad_mixta(cant),
+             f"${venta:.2f}", f"${ganancia:.2f}"]
             for n, cat, cant, venta, ganancia in top_ganancia
         ])
         self._set_tabla(self._tabla_baja_rotacion, [
-            [n, cat, cant, stock, ultima]
+            [n, cat, formatear_cantidad_mixta(cant),
+             formatear_cantidad_mixta(stock), ultima]
             for n, cat, cant, stock, ultima in baja_rotacion
         ])
         self._set_tabla(self._tabla_rep_horas, [
@@ -6648,7 +7860,8 @@ class POSAbarrotes(QMainWindow):
         ])
         self._set_tabla(self._tabla_rep_categorias, [
             [
-                cat, cant, f"${venta:.2f}", f"${costo:.2f}",
+                cat, formatear_cantidad_mixta(cant),
+                f"${venta:.2f}", f"${costo:.2f}",
                 f"${(venta - costo):.2f}",
                 f"{((venta - costo) / venta * 100) if venta else 0:.1f}%",
             ]

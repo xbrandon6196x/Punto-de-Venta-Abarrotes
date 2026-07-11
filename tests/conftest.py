@@ -19,5 +19,8 @@ import pos_abarrotes
 def bd_temporal(tmp_path, monkeypatch):
     """BD nueva y aislada por test, con esquema y usuarios iniciales."""
     monkeypatch.chdir(tmp_path)
+    # PBKDF2 con pocas iteraciones en tests: misma lógica y mismo formato,
+    # sin pagar el costo real (600k por hash) en cada test.
+    monkeypatch.setattr(pos_abarrotes, "ITERACIONES_PBKDF2", 1_000)
     pos_abarrotes.crear_tablas()
     return tmp_path

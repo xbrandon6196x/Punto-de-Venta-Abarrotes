@@ -7,9 +7,9 @@ Estados: `PENDIENTE` · `EN SPEC` · `EN DESARROLLO` · `HECHA` · `DESCARTADA`
 
 | # | Feature | Valor | Riesgo | Estado |
 |---|---------|-------|--------|--------|
-| 1 | **Reportes ampliados**: comparativas por periodo (semana/mes vs anterior), exportar a Excel/CSV y PDF, gráficas de ventas | Alto | Bajo (solo lectura de datos) | PENDIENTE |
-| 2 | **Endurecer contraseñas**: hash con sal (p. ej. PBKDF2 de stdlib), migrando los hashes existentes al primer login; forzar cambio de las claves por defecto | Medio | Bajo-medio | PENDIENTE |
-| 3 | **Productos a granel (kg/gr)**: vender por peso huevo, jamón, queso, etc. — precio por kg, captura de peso o de monto, stock en decimales | Muy alto (operación diaria real) | Medio-alto (cambia `stock` y `cantidad` de INTEGER a REAL en BD, ticket, corte y reportes) | PENDIENTE |
+| 1 | **Reportes ampliados**: comparativas por periodo (semana/mes vs anterior), exportar a CSV y PDF, gráficas de ventas (`spec/features/001-reportes-ampliados`) | Alto | Bajo (solo lectura de datos) | HECHA (2026-07-08, verificador APROBADO; falta commit) |
+| 2 | **Endurecer contraseñas**: hash con sal (PBKDF2 de stdlib), migrando los hashes existentes al primer login; forzar cambio de las claves por defecto (`spec/features/002-endurecer-contrasenas`) | Medio | Bajo-medio | HECHA (2026-07-09, verificador APROBADO; falta commit) |
+| 3 | **Productos a granel (kg/gr)**: vender por peso huevo, jamón, queso, etc. — precio por kg, captura de peso o de monto, stock en decimales (`spec/features/003-productos-a-granel`) | Muy alto (operación diaria real) | Medio (la afinidad de SQLite evita el ALTER de tipos; solo columna aditiva `es_granel` + formateo) | HECHA (2026-07-10, verificador APROBADO en ciclo 2; falta commit) |
 | 4 | **Multi-equipo / red**: usar el POS desde más de una computadora o sincronizar la base | Alto | Alto (SQLite es archivo local; requiere decidir arquitectura: carpeta compartida con WAL ≠ seguro, o servidor) | PENDIENTE |
 
 ## Notas de descubrimiento (Fase 0 del bootstrap, 2026-07-08)

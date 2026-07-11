@@ -47,8 +47,13 @@ ruta relativa al directorio de trabajo). Respaldo automático en
 5. **Códigos manuales**: productos sin código de barras usan
    `MANUAL-<timestamp>` (`generar_codigo_manual()`); en UI se muestran como
    "Sin código" (`codigo_visible()`). `codigo_barras` nunca puede ser NULL/''.
-6. **Stock es INTEGER hoy.** La feature de granel (kg/gr) del roadmap lo
-   cambiará a REAL — eso requiere spec propia; no lo hagas de paso.
+6. **Cantidades y granel (feature 003):** `productos.es_granel` (0/1)
+   marca el modo. Para productos a granel, `stock` y las columnas
+   `cantidad` guardan kg con decimales (la afinidad de SQLite almacena
+   REAL en la columna INTEGER declarada — sin ALTER). Las piezas siguen
+   siendo enteras. Comparaciones de peso con `TOLERANCIA_PESO` (1e-6) y
+   redondeo al gramo con `redondear_peso()`; formateo SIEMPRE vía
+   `formatear_cantidad()` / `formatear_cantidad_mixta()`.
 
 ## Después de editar esquema o queries
 
