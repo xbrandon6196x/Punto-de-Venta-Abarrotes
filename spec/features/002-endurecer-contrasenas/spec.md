@@ -32,9 +32,12 @@ a mano.
 - **Migración automática al primer login:** los hashes SHA-256 existentes
   de las instalaciones reales siguen funcionando; al iniciar sesión con
   éxito, el hash se actualiza al formato nuevo de forma silenciosa.
-- **Cambio forzado:** si la contraseña usada para entrar es una de las
-  claves por defecto, aparece un diálogo obligatorio de nueva contraseña
-  antes de llegar a la caja (aplica a admin y vendedores).
+- **Cambio sugerido (no forzado):** si la contraseña usada para entrar
+  es una de las claves por defecto, la app INVITA a cambiarla («¿quieres
+  ponerte una propia?») pero deja pasar si el usuario dice que no —
+  decisión del dueño 2026-07-10: el personal ya se aprendió las claves
+  actuales y no se le quiere bloquear el paso. La invitación aparece en
+  cada login con clave por defecto.
 - **«Cambiar mi contraseña»:** cualquier usuario puede cambiar la suya
   desde la app (pidiendo la actual).
 - **Reseteo por admin:** el administrador puede asignar una contraseña
@@ -66,10 +69,11 @@ Verificables uno a uno. El verificador los revisará contra el diff real.
       con su misma contraseña, y tras ese login su hash queda en formato
       `pbkdf2$...` sin que él haga nada.
 - [ ] Al entrar con una clave por defecto (p. ej. admin/admin123) la app
-      exige elegir contraseña nueva antes de mostrar la ventana principal;
-      la nueva no puede ser vacía ni otra clave por defecto.
-- [ ] Tras el cambio forzado, el siguiente login con la clave vieja falla
-      y con la nueva funciona.
+      OFRECE elegir contraseña nueva; si el usuario acepta, la nueva no
+      puede ser vacía ni otra clave por defecto; si dice que no, entra
+      normalmente con su clave de siempre (actualizado 2026-07-10).
+- [ ] Tras cambiar la contraseña, el siguiente login con la clave vieja
+      falla y con la nueva funciona.
 - [ ] Todo usuario tiene a la mano «Cambiar mi contraseña» (pide la
       actual y la nueva); con la actual incorrecta no cambia nada.
 - [ ] El admin puede asignar contraseña nueva a cualquier usuario activo

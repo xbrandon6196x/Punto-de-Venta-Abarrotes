@@ -1,5 +1,5 @@
 {
-  "_ayuda": "Edita este archivo para cambiar las frases y animaciones del perrito sin tocar el código. En 'frases' cada evento tiene su lista de mensajes ({nombre} se sustituye por el vendedor). En 'animaciones' se asocia cada evento/estado con el nombre de un GIF (sin .gif) que esté dentro de la carpeta assets/ o sus subcarpetas. Si un GIF no existe, el perrito usa la animación de caminar o sus frames originales.",
+  "_ayuda": "Edita este archivo para cambiar las frases y animaciones del perrito sin tocar el código. En 'frases' cada evento tiene su lista de mensajes ({nombre} se sustituye por el vendedor). En 'animaciones' se asocia cada evento/estado con el nombre de un GIF (sin .gif) que esté dentro de la carpeta assets/ o sus subcarpetas. Si un GIF no existe, el perrito usa la animación de caminar o sus frames originales. Eventos disponibles: login, venta, granel, apartado, abono, prestamo, devolucion, compra, exportar, password, corte, inactividad, casual.",
   "modo_animaciones": "aleatorio",
   "animaciones_aleatorias": [
     "caminando",
@@ -13,50 +13,101 @@
       "¡Buen día, {nombre}!",
       "¡Hola {nombre}! A darle con todo",
       "¡Guau! Qué gusto verte, {nombre}",
-      "Caja lista, ¡vamos {nombre}!"
+      "Caja lista, ¡vamos {nombre}!",
+      "¡Se abre la tienda, {nombre}!",
+      "Hoy va a ser buen día de ventas",
+      "Periquita y yo te extrañábamos",
+      "¡A romperla hoy, {nombre}!"
     ],
     "venta": [
       "¡Venta guardada! 🎉",
       "¡Otra venta más, {nombre}!",
       "¡Ka-ching! Buen trabajo",
       "¡Eso! La caja va creciendo",
-      "¡Vendido! Sigamos así"
+      "¡Vendido! Sigamos así",
+      "¡Cliente feliz, caja feliz!",
+      "¡Así se hace, {nombre}!",
+      "Otra más para Periquita",
+      "¡Guau guau! ¡Vendido!"
+    ],
+    "granel": [
+      "¡Al puro peso, como en el mercado!",
+      "Pesadito y bien cobrado",
+      "¡Ni un gramo de más, ni uno de menos!",
+      "Al gramo exacto, {nombre}",
+      "¡Esa báscula no falla!",
+      "¡Ese granel voló!"
     ],
     "apartado": [
       "¡Apartado registrado!",
       "Producto apartado con éxito",
       "El cliente ya tiene su apartado",
-      "Apartado guardado, ¡bien hecho!"
+      "Apartado guardado, ¡bien hecho!",
+      "Guardadito hasta que regrese",
+      "Ese producto ya tiene dueño",
+      "Yo lo cuido, no se apura"
     ],
     "abono": [
       "¡Abono recibido!",
       "El cliente va avanzando",
       "¡Cada abono cuenta!",
-      "Abono guardado correctamente"
+      "Abono guardado correctamente",
+      "Poquito a poquito se llena el cochinito",
+      "La cuenta baja, la confianza sube"
     ],
     "prestamo": [
       "¡Préstamo registrado!",
       "Anoté lo que se llevó el cliente",
       "Préstamo guardado, yo lo vigilo 👀",
-      "¡Listo! Préstamo bajo control"
+      "¡Listo! Préstamo bajo control",
+      "Fiado registrado, yo no olvido 🐶",
+      "Apuntado con lápiz que no se borra",
+      "Confianza sí, pero apuntada"
     ],
     "devolucion": [
       "¡Producto de vuelta al inventario!",
       "Devolución registrada",
       "¡Regresó la mercancía!",
-      "Inventario actualizado"
+      "Inventario actualizado",
+      "Todo vuelve a su lugar",
+      "¡De regreso al estante!"
+    ],
+    "compra": [
+      "¡Llegó mercancía nueva!",
+      "Estantes llenos, clientes contentos",
+      "¡A acomodar cajas se ha dicho!",
+      "Inventario recargado 💪",
+      "El proveedor cumplió, ¡a vender!"
+    ],
+    "exportar": [
+      "¡Reporte listo para llevar!",
+      "Números empaquetados y enviados",
+      "Ese archivo quedó bonito",
+      "Datos para el jefe, ¡marchando!"
+    ],
+    "password": [
+      "¡Clave nueva, cuenta segura!",
+      "Ese secreto está a salvo conmigo",
+      "Ni yo me la sé, así de segura 🔒",
+      "Candado cambiado, {nombre}"
     ],
     "corte": [
       "¡Corte de caja listo!",
       "Buen cierre, {nombre}",
       "Cuentas claras, ¡a descansar!",
-      "¡Día completado! 🐾"
+      "¡Día completado! 🐾",
+      "Caja contada y cuadrada",
+      "Hasta mañana, yo cuido la tienda 🐾",
+      "¡Se acabó el turno, buen trabajo!"
     ],
     "inactividad": [
       "¿Sigues ahí, {nombre}?",
       "Aquí espero, sin prisa",
       "Zzz... avísame si me necesitas",
-      "Estiro las patitas mientras tanto"
+      "Estiro las patitas mientras tanto",
+      "¿Un cafecito mientras?",
+      "Sigo aquí, moviendo la colita",
+      "Me eché una siestita, no me acuses"
     ],
     "casual": [
       "Vamos con todo, {nombre}",
@@ -66,18 +117,29 @@
       "Buen trabajo, {nombre}",
       "Periquita va fuerte",
       "Escanea y seguimos",
-      "Datos a salvo"
+      "Datos a salvo",
+      "El que persevera, vende",
+      "Periquita, la mejor tienda del rumbo",
+      "¿Ya revisaste el stock bajito?",
+      "Un perrito siempre es buen socio",
+      "Cliente que llega, cliente que vuelve",
+      "¡Ánimo, que hoy se vende bien!"
     ]
   },
   "animaciones": {
     "caminando": "caminando",
     "idle": "idle_parado",
+    "casual": "caminando",
     "login": "saludando",
     "venta": "saltando",
+    "granel": "saltando",
     "apartado": "saludando",
     "abono": "saltando",
     "prestamo": "saludando",
     "devolucion": "girando_360",
+    "compra": "girando_360",
+    "exportar": "saludando",
+    "password": "saludando",
     "corte": "girando_360",
     "inactividad": "idle_parado",
     "festejo": "saltando",

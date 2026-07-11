@@ -75,6 +75,10 @@ FRASES_PERRITO = {
         "¡Hola {nombre}! A darle con todo",
         "¡Guau! Qué gusto verte, {nombre}",
         "Caja lista, ¡vamos {nombre}!",
+        "¡Se abre la tienda, {nombre}!",
+        "Hoy va a ser buen día de ventas",
+        "Periquita y yo te extrañábamos",
+        "¡A romperla hoy, {nombre}!",
     ],
     "venta": [
         "¡Venta guardada! 🎉",
@@ -82,42 +86,89 @@ FRASES_PERRITO = {
         "¡Ka-ching! Buen trabajo",
         "¡Eso! La caja va creciendo",
         "¡Vendido! Sigamos así",
+        "¡Cliente feliz, caja feliz!",
+        "¡Así se hace, {nombre}!",
+        "Otra más para Periquita",
+        "¡Guau guau! ¡Vendido!",
+    ],
+    "granel": [
+        "¡Al puro peso, como en el mercado!",
+        "Pesadito y bien cobrado",
+        "¡Ni un gramo de más, ni uno de menos!",
+        "Al gramo exacto, {nombre}",
+        "¡Esa báscula no falla!",
+        "¡Ese granel voló!",
     ],
     "apartado": [
         "¡Apartado registrado!",
         "Producto apartado con éxito",
         "El cliente ya tiene su apartado",
         "Apartado guardado, ¡bien hecho!",
+        "Guardadito hasta que regrese",
+        "Ese producto ya tiene dueño",
+        "Yo lo cuido, no se apura",
     ],
     "abono": [
         "¡Abono recibido!",
         "El cliente va avanzando",
         "¡Cada abono cuenta!",
         "Abono guardado correctamente",
+        "Poquito a poquito se llena el cochinito",
+        "La cuenta baja, la confianza sube",
     ],
     "prestamo": [
         "¡Préstamo registrado!",
         "Anoté lo que se llevó el cliente",
         "Préstamo guardado, yo lo vigilo 👀",
         "¡Listo! Préstamo bajo control",
+        "Fiado registrado, yo no olvido 🐶",
+        "Apuntado con lápiz que no se borra",
+        "Confianza sí, pero apuntada",
     ],
     "devolucion": [
         "¡Producto de vuelta al inventario!",
         "Devolución registrada",
         "¡Regresó la mercancía!",
         "Inventario actualizado",
+        "Todo vuelve a su lugar",
+        "¡De regreso al estante!",
+    ],
+    "compra": [
+        "¡Llegó mercancía nueva!",
+        "Estantes llenos, clientes contentos",
+        "¡A acomodar cajas se ha dicho!",
+        "Inventario recargado 💪",
+        "El proveedor cumplió, ¡a vender!",
+    ],
+    "exportar": [
+        "¡Reporte listo para llevar!",
+        "Números empaquetados y enviados",
+        "Ese archivo quedó bonito",
+        "Datos para el jefe, ¡marchando!",
+    ],
+    "password": [
+        "¡Clave nueva, cuenta segura!",
+        "Ese secreto está a salvo conmigo",
+        "Ni yo me la sé, así de segura 🔒",
+        "Candado cambiado, {nombre}",
     ],
     "corte": [
         "¡Corte de caja listo!",
         "Buen cierre, {nombre}",
         "Cuentas claras, ¡a descansar!",
         "¡Día completado! 🐾",
+        "Caja contada y cuadrada",
+        "Hasta mañana, yo cuido la tienda 🐾",
+        "¡Se acabó el turno, buen trabajo!",
     ],
     "inactividad": [
         "¿Sigues ahí, {nombre}?",
         "Aquí espero, sin prisa",
         "Zzz... avísame si me necesitas",
         "Estiro las patitas mientras tanto",
+        "¿Un cafecito mientras?",
+        "Sigo aquí, moviendo la colita",
+        "Me eché una siestita, no me acuses",
     ],
     "casual": [
         "Vamos con todo, {nombre}",
@@ -128,6 +179,12 @@ FRASES_PERRITO = {
         "Periquita va fuerte",
         "Escanea y seguimos",
         "Datos a salvo",
+        "El que persevera, vende",
+        "Periquita, la mejor tienda del rumbo",
+        "¿Ya revisaste el stock bajito?",
+        "Un perrito siempre es buen socio",
+        "Cliente que llega, cliente que vuelve",
+        "¡Ánimo, que hoy se vende bien!",
     ],
 }
 
@@ -138,12 +195,17 @@ FRASES_PERRITO = {
 ANIMACIONES_PERRITO = {
     "caminando":   "caminando",
     "idle":        "idle_parado",
+    "casual":      "caminando",
     "login":       "saludando",
     "venta":       "saltando",
+    "granel":      "saltando",
     "apartado":    "saludando",
     "abono":       "saltando",
     "prestamo":    "saludando",
     "devolucion":  "girando_360",
+    "compra":      "girando_360",
+    "exportar":    "saludando",
+    "password":    "saludando",
     "corte":       "girando_360",
     "inactividad": "idle_parado",
     "festejo":     "saltando",
@@ -1779,8 +1841,9 @@ class DialogoLogin(QDialog):
 
 class DialogoCambioContrasena(QDialog):
     """Cambio de contraseña en tres modos:
-    - "forzado": tras entrar con una clave por defecto; no pide la actual
-      (quien llama decide qué pasa si se cancela: regresar al login).
+    - "sugerido": tras entrar con una clave por defecto; no pide la
+      actual y se puede cancelar sin consecuencias (la invitación la
+      hace quien llama).
     - "voluntario": el usuario cambia la suya; exige la actual.
     - "admin": incluye combo de usuarios activos; para sí mismo exige la
       actual, para otros la asigna directo (reseteo)."""
@@ -1795,17 +1858,17 @@ class DialogoCambioContrasena(QDialog):
         lay = QVBoxLayout(self)
         lay.setSpacing(10)
 
-        titulo = QLabel("Elige tu contraseña nueva" if modo == "forzado"
+        titulo = QLabel("Elige tu contraseña nueva" if modo == "sugerido"
                         else "Cambiar contraseña")
         titulo.setObjectName("lbl_titulo")
         titulo.setAlignment(Qt.AlignCenter)
         lay.addWidget(titulo)
 
-        if modo == "forzado":
+        if modo == "sugerido":
             aviso = QLabel(
                 "Entraste con una clave por defecto del sistema. "
-                "Por seguridad debes elegir una contraseña nueva "
-                "antes de usar la caja."
+                "Elige una contraseña propia, o cancela si prefieres "
+                "seguir con la de siempre."
             )
             aviso.setWordWrap(True)
             aviso.setStyleSheet("color: #f9e2af;")
@@ -1836,7 +1899,7 @@ class DialogoCambioContrasena(QDialog):
         self._inp_actual = QLineEdit()
         self._inp_actual.setEchoMode(QLineEdit.Password)
         self._fila_actual = self._form.rowCount()
-        if modo != "forzado":
+        if modo != "sugerido":
             self._form.addRow("Contraseña actual:", self._inp_actual)
 
         self._inp_nueva = QLineEdit()
@@ -1865,8 +1928,9 @@ class DialogoCambioContrasena(QDialog):
 
     def _requiere_actual(self):
         # El reseteo por admin a OTRO usuario no exige la contraseña
-        # anterior; el cambio propio (salvo el forzado) siempre sí.
-        if self._modo == "forzado":
+        # anterior; el cambio propio (salvo el sugerido, que llega recién
+        # autenticado con la clave por defecto) siempre sí.
+        if self._modo == "sugerido":
             return False
         return self._usuario_objetivo() == self._usuario_actual["id"]
 
@@ -2153,6 +2217,11 @@ class AsistentePerrito(QWidget):
         self._timer_inactividad.timeout.connect(self._checar_inactividad)
         self._timer_inactividad.start(30000)
 
+        # Travesuras: de vez en cuando hace una gracia sin decir nada
+        self._timer_travesura = QTimer(self)
+        self._timer_travesura.timeout.connect(self._travesura)
+        self._timer_travesura.start(21000)
+
         self._set_estado("caminando")
         if self._movie is None:
             self._actualizar_frame()
@@ -2232,7 +2301,14 @@ class AsistentePerrito(QWidget):
         return ruta
 
     def _set_estado(self, estado, duracion_ms=0):
-        if self._modo_animaciones == "aleatorio":
+        # En modo aleatorio, los EVENTOS conservan su animación propia
+        # (venta salta, corte gira…) para que la reacción tenga sentido;
+        # solo el paseo base y los mensajes casuales varían al azar.
+        es_evento_expresivo = (
+            estado in self._animaciones
+            and estado not in ("caminando", "casual")
+        )
+        if self._modo_animaciones == "aleatorio" and not es_evento_expresivo:
             ruta = self._ruta_animacion_aleatoria()
         else:
             ruta = self._ruta_animacion_por_evento(estado)
@@ -2309,6 +2385,20 @@ class AsistentePerrito(QWidget):
         self._frame_idx = (self._frame_idx + 1) % len(self._frames)
         self._actualizar_frame()
 
+    def _travesura(self):
+        """Gracia espontánea mientras pasea: cambia el paso o hace una
+        pirueta breve, sin globo de texto (para no saturar)."""
+        if self._estado != "caminando" or self._bubble.isVisible():
+            return
+        if random.random() < 0.4:
+            # Solo cambia de ritmo o de rumbo
+            self._dx = random.choice([-2, -1, 1, 2])
+            return
+        self._set_estado(
+            random.choice(["festejo", "espera", "devolucion"]),
+            random.randint(2500, 4500),
+        )
+
     def _mover(self):
         parent = self.parent()
         if not parent:
@@ -2316,10 +2406,12 @@ class AsistentePerrito(QWidget):
         max_x = max(0, parent.width() - self.width() - 20)
         target_y = max(80, parent.height() - self.height() - 36)
         self._y = int(self._y + (target_y - self._y) * 0.18)
-        self._x += self._dx
-        if self._x <= 10 or self._x >= max_x:
-            self._dx *= -1
-            self._x = max(10, min(self._x, max_x))
+        # Se detiene a platicar: el globo se lee mejor si no se mueve
+        if not self._bubble.isVisible():
+            self._x += self._dx
+            if self._x <= 10 or self._x >= max_x:
+                self._dx *= -1
+                self._x = max(10, min(self._x, max_x))
         self.move(int(self._x), int(self._y))
         self.raise_()
 
@@ -3194,14 +3286,22 @@ def pedir_usuario_y_fondo(parent=None):
     if login.exec() != QDialog.Accepted:
         return None, None
 
-    # Clave por defecto: obligar a elegir una nueva antes de continuar.
-    # Cancelar el diálogo NO deja entrar (regresa al login/salida).
+    # Clave por defecto: INVITAR a cambiarla, sin bloquear el paso
+    # (decisión del dueño 2026-07-10: el personal ya se las aprendió).
     if login.usuario_actual.get("password_por_defecto"):
-        cambio = DialogoCambioContrasena(
-            login.usuario_actual, modo="forzado", parent=parent)
-        if cambio.exec() != QDialog.Accepted:
-            return None, None
-        login.usuario_actual["password_por_defecto"] = False
+        r = QMessageBox.question(
+            parent, "Contraseña por defecto",
+            "Estás entrando con una clave por defecto del sistema.\n"
+            "Puedes seguir usándola, pero es más seguro ponerte una propia.\n\n"
+            "¿Quieres cambiarla ahora? (También puedes hacerlo después\n"
+            "con el botón «🔑 Contraseña» de la barra inferior.)",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if r == QMessageBox.Yes:
+            cambio = DialogoCambioContrasena(
+                login.usuario_actual, modo="sugerido", parent=parent)
+            if cambio.exec() == QDialog.Accepted:
+                login.usuario_actual["password_por_defecto"] = False
 
     if login.usuario_actual["rol"] == "vendedor":
         nombre_turno = DialogoNombreVendedor(login.usuario_actual, parent)
@@ -3491,7 +3591,9 @@ class POSAbarrotes(QMainWindow):
         # Admin: puede resetear a cualquiera (el suyo pide la actual).
         # Vendedor: solo la suya, pidiendo la actual.
         modo = "admin" if self._es_admin else "voluntario"
-        DialogoCambioContrasena(self._usuario_actual, modo=modo, parent=self).exec()
+        dlg = DialogoCambioContrasena(self._usuario_actual, modo=modo, parent=self)
+        if dlg.exec() == QDialog.Accepted:
+            self._perrito_evento("password")
 
     def _cerrar_sesion(self):
         if not self._confirmar_salida("cerrar sesión"):
@@ -4087,6 +4189,7 @@ class POSAbarrotes(QMainWindow):
                 msg += f"\nEfectivo recibido: ${efec:.2f}"
                 msg += f"\nCambio entregado:  ${efec - total:.2f}"
 
+            hubo_granel = any(i.get("es_granel") for i in self._ticket)
             self._ticket.clear()
             self._refrescar_ticket()
             self._spin_efectivo.setValue(0)
@@ -4102,7 +4205,7 @@ class POSAbarrotes(QMainWindow):
             self._statusbar.showMessage(
                 f"Venta #{vid} registrada — ${total:.2f}  ({metodo})", 6000
             )
-            self._perrito_evento("venta")
+            self._perrito_evento("granel" if hubo_granel else "venta")
             self._enfocar_codigo_venta()
 
         except Exception as e:
@@ -7057,6 +7160,7 @@ class POSAbarrotes(QMainWindow):
             self, "Compra guardada",
             f"Compra #{compra_id} registrada por ${total:.2f}."
         )
+        self._perrito_evento("compra")
 
     def _cargar_historial_compras(self):
         if not hasattr(self, "_tabla_hist_compras"):
@@ -7268,6 +7372,7 @@ class POSAbarrotes(QMainWindow):
             return
         QMessageBox.information(self, "Reporte exportado",
                                 f"El reporte se guardó en:\n{ruta}")
+        self._perrito_evento("exportar")
 
     def _exportar_reporte_pdf(self):
         datos = self._datos_reporte_visible()
@@ -7301,6 +7406,7 @@ class POSAbarrotes(QMainWindow):
             return
         QMessageBox.information(self, "Reporte exportado",
                                 f"El reporte se guardó en:\n{ruta}")
+        self._perrito_evento("exportar")
 
     # ── sub-pestaña Comparativa ────────────────────────────
 
