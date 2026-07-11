@@ -71,12 +71,11 @@ def test_agregar_columna_si_falta_es_idempotente(bd_temporal):
     assert columnas.count("columna_prueba") == 1
 
 
-def test_login_con_usuarios_iniciales(bd_temporal):
-    usuario, _nombre, rol, contrasena = pos.USUARIOS_INICIALES[0]
-    sesion = pos.validar_login(usuario, contrasena)
+def test_login_con_usuarios_de_prueba(bd_temporal):
+    sesion = pos.validar_login("admin", "clave-prueba-admin")
     assert sesion is not None
-    assert sesion["rol"] == rol
-    assert pos.validar_login(usuario, "contraseña-incorrecta") is None
+    assert sesion["rol"] == "admin"
+    assert pos.validar_login("admin", "contraseña-incorrecta") is None
     assert pos.validar_login("no-existe", "lo-que-sea") is None
 
 
@@ -105,7 +104,7 @@ def _insertar_venta(c, sesion_id, usuario_id, total, metodo):
 
 
 def test_resumen_y_cierre_de_caja(bd_temporal):
-    admin = pos.validar_login("admin", "admin123")
+    admin = pos.validar_login("admin", "clave-prueba-admin")
     sesion_id = pos.iniciar_registro_sesion(
         admin["id"], fondo_inicial=200, vendedor_nombre="Prueba"
     )

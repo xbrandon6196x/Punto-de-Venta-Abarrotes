@@ -58,7 +58,7 @@ def _sembrar_granel(stock=5.0):
 
 
 def _ventana(qapp):
-    admin = pos.validar_login("admin", "admin123")
+    admin = pos.validar_login("admin", "clave-prueba-admin")
     return pos.POSAbarrotes(admin, fondo_inicial=100)
 
 

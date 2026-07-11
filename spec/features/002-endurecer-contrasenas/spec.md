@@ -32,12 +32,11 @@ a mano.
 - **Migración automática al primer login:** los hashes SHA-256 existentes
   de las instalaciones reales siguen funcionando; al iniciar sesión con
   éxito, el hash se actualiza al formato nuevo de forma silenciosa.
-- **Cambio sugerido (no forzado):** si la contraseña usada para entrar
-  es una de las claves por defecto, la app INVITA a cambiarla («¿quieres
-  ponerte una propia?») pero deja pasar si el usuario dice que no —
-  decisión del dueño 2026-07-10: el personal ya se aprendió las claves
-  actuales y no se le quiere bloquear el paso. La invitación aparece en
-  cada login con clave por defecto.
+- ~~Cambio sugerido con clave por defecto~~ **SUSTITUIDO por la feature
+  004 (2026-07-10):** las claves por defecto se eliminaron del código
+  (repo público); ya no existe lista contra la cual sugerir. Las
+  instalaciones existentes entran con sus claves de siempre sin ningún
+  aviso, y las nuevas eligen las suyas en el primer arranque.
 - **«Cambiar mi contraseña»:** cualquier usuario puede cambiar la suya
   desde la app (pidiendo la actual).
 - **Reseteo por admin:** el administrador puede asignar una contraseña

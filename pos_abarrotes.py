@@ -212,13 +212,11 @@ ANIMACIONES_PERRITO = {
     "espera":      "idle_parado",
 }
 
-USUARIOS_INICIALES = [
-    ("admin", "Administrador", "admin", "admin123"),
-    ("vendedor", "Perfil de ventas", "vendedor", "venta123"),
-    ("vendedor1", "Vendedor 1", "vendedor", "venta123"),
-    ("vendedor2", "Vendedor 2", "vendedor", "venta456"),
-    ("vendedor3", "Vendedor 3", "vendedor", "venta789"),
-]
+# Los usuarios y contraseñas iniciales YA NO viven en el código (el repo
+# es público): en el primer arranque con BD nueva, la app pide al dueño
+# crear las cuentas «admin» y «vendedor» con claves elegidas por él
+# (DialogoPrimerUsuario). Las instalaciones existentes conservan sus
+# usuarios en la BD y no se ven afectadas.
 
 ESTILO = """
 QMainWindow, QWidget, QDialog {
@@ -401,34 +399,34 @@ def verificar_password(contrasena, hash_guardado):
     return hmac.compare_digest(hash_password(contrasena), hash_guardado)
 
 
-def es_password_por_defecto(contrasena):
-    return contrasena in {clave for _u, _n, _r, clave in USUARIOS_INICIALES}
-
-
 def cambiar_password(usuario_id, nueva):
     """Valida la contraseña nueva y la guarda con hash PBKDF2.
     Levanta ValueError con mensaje humano si no cumple las reglas."""
     if not nueva or not nueva.strip():
         raise ValueError("La contraseña nueva no puede estar vacía.")
-    if es_password_por_defecto(nueva):
-        raise ValueError("Esa es una de las claves por defecto del sistema.\n"
-                         "Elige una contraseña diferente.")
     with conectar() as conn:
         conn.execute("UPDATE usuarios SET password_hash = ? WHERE id = ?",
                      (hash_password_pbkdf2(nueva), usuario_id))
 
 
-def crear_usuarios_iniciales(conn):
-    c = conn.cursor()
-    for usuario, nombre, rol, contrasena in USUARIOS_INICIALES:
-        c.execute("""
-            INSERT OR IGNORE INTO usuarios
-                (usuario, nombre, rol, password_hash, activo, fecha_alta)
-            VALUES (?, ?, ?, ?, 1, ?)
-        """, (
-            usuario, nombre, rol, hash_password_pbkdf2(contrasena),
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        ))
+def crear_usuario(conn, usuario, nombre, rol, contrasena):
+    """Alta de una cuenta con hash PBKDF2 (usada por el primer arranque
+    y por los tests). Respeta el UNIQUE de `usuario`."""
+    conn.execute("""
+        INSERT OR IGNORE INTO usuarios
+            (usuario, nombre, rol, password_hash, activo, fecha_alta)
+        VALUES (?, ?, ?, ?, 1, ?)
+    """, (
+        usuario, nombre, rol, hash_password_pbkdf2(contrasena),
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    ))
+
+
+def hay_usuarios_activos():
+    with conectar() as conn:
+        (cuantos,) = conn.execute(
+            "SELECT COUNT(*) FROM usuarios WHERE activo = 1").fetchone()
+    return cuantos > 0
 
 
 def validar_login(usuario, contrasena):
@@ -460,7 +458,6 @@ def validar_login(usuario, contrasena):
         "usuario": user,
         "nombre": nombre,
         "rol": rol,
-        "password_por_defecto": es_password_por_defecto(contrasena),
     }
 
 
@@ -815,7 +812,8 @@ def crear_tablas():
         # stock/cantidades en kg con decimales — la afinidad de SQLite los
         # guarda como REAL en las columnas INTEGER existentes).
         agregar_columna_si_falta(conn, "productos", "es_granel", "INTEGER DEFAULT 0")
-        crear_usuarios_iniciales(conn)
+        # Ya no se siembran usuarios con claves fijas: en BD nueva, el
+        # primer arranque pide crearlos (ver DialogoPrimerUsuario).
 
 
 def es_codigo_manual(codigo):
@@ -1840,10 +1838,7 @@ class DialogoLogin(QDialog):
 
 
 class DialogoCambioContrasena(QDialog):
-    """Cambio de contraseña en tres modos:
-    - "sugerido": tras entrar con una clave por defecto; no pide la
-      actual y se puede cancelar sin consecuencias (la invitación la
-      hace quien llama).
+    """Cambio de contraseña en dos modos:
     - "voluntario": el usuario cambia la suya; exige la actual.
     - "admin": incluye combo de usuarios activos; para sí mismo exige la
       actual, para otros la asigna directo (reseteo)."""
@@ -1858,21 +1853,10 @@ class DialogoCambioContrasena(QDialog):
         lay = QVBoxLayout(self)
         lay.setSpacing(10)
 
-        titulo = QLabel("Elige tu contraseña nueva" if modo == "sugerido"
-                        else "Cambiar contraseña")
+        titulo = QLabel("Cambiar contraseña")
         titulo.setObjectName("lbl_titulo")
         titulo.setAlignment(Qt.AlignCenter)
         lay.addWidget(titulo)
-
-        if modo == "sugerido":
-            aviso = QLabel(
-                "Entraste con una clave por defecto del sistema. "
-                "Elige una contraseña propia, o cancela si prefieres "
-                "seguir con la de siempre."
-            )
-            aviso.setWordWrap(True)
-            aviso.setStyleSheet("color: #f9e2af;")
-            lay.addWidget(aviso)
 
         self._form = QFormLayout()
         self._form.setSpacing(10)
@@ -1899,8 +1883,7 @@ class DialogoCambioContrasena(QDialog):
         self._inp_actual = QLineEdit()
         self._inp_actual.setEchoMode(QLineEdit.Password)
         self._fila_actual = self._form.rowCount()
-        if modo != "sugerido":
-            self._form.addRow("Contraseña actual:", self._inp_actual)
+        self._form.addRow("Contraseña actual:", self._inp_actual)
 
         self._inp_nueva = QLineEdit()
         self._inp_nueva.setEchoMode(QLineEdit.Password)
@@ -1928,10 +1911,7 @@ class DialogoCambioContrasena(QDialog):
 
     def _requiere_actual(self):
         # El reseteo por admin a OTRO usuario no exige la contraseña
-        # anterior; el cambio propio (salvo el sugerido, que llega recién
-        # autenticado con la clave por defecto) siempre sí.
-        if self._modo == "sugerido":
-            return False
+        # anterior; el cambio propio siempre sí.
         return self._usuario_objetivo() == self._usuario_actual["id"]
 
     def _actualizar_campo_actual(self):
@@ -1968,6 +1948,106 @@ class DialogoCambioContrasena(QDialog):
 
         QMessageBox.information(self, "Contraseña cambiada",
                                 "La contraseña se guardó correctamente.")
+        self.accept()
+
+
+class DialogoPrimerUsuario(QDialog):
+    """Primer arranque con BD nueva: el dueño crea las cuentas «admin» y
+    «vendedor» con contraseñas elegidas por él. Así el código publicado
+    no contiene ninguna clave."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Bienvenido — Tienda Periquita")
+        self.setMinimumWidth(430)
+
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+
+        titulo = QLabel("Configura tus cuentas")
+        titulo.setObjectName("lbl_titulo")
+        titulo.setAlignment(Qt.AlignCenter)
+        lay.addWidget(titulo)
+
+        ayuda = QLabel(
+            "Es la primera vez que se abre el sistema en esta computadora. "
+            "Elige las contraseñas de la cuenta de administrador («admin») "
+            "y de la cuenta de caja («vendedor»). Podrás cambiarlas después "
+            "con el botón «🔑 Contraseña»."
+        )
+        ayuda.setWordWrap(True)
+        ayuda.setStyleSheet("color: #a6adc8;")
+        lay.addWidget(ayuda)
+
+        form = QFormLayout()
+        form.setSpacing(10)
+
+        self._inp_admin = QLineEdit()
+        self._inp_admin.setEchoMode(QLineEdit.Password)
+        form.addRow("Contraseña de admin:", self._inp_admin)
+
+        self._inp_admin2 = QLineEdit()
+        self._inp_admin2.setEchoMode(QLineEdit.Password)
+        form.addRow("Confirmar admin:", self._inp_admin2)
+
+        self._inp_vendedor = QLineEdit()
+        self._inp_vendedor.setEchoMode(QLineEdit.Password)
+        form.addRow("Contraseña de vendedor:", self._inp_vendedor)
+
+        self._inp_vendedor2 = QLineEdit()
+        self._inp_vendedor2.setEchoMode(QLineEdit.Password)
+        form.addRow("Confirmar vendedor:", self._inp_vendedor2)
+
+        lay.addLayout(form)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("Crear cuentas")
+        btns.button(QDialogButtonBox.Cancel).setText("Salir")
+        btns.accepted.connect(self._crear)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+        self._inp_admin.setFocus()
+
+    def _crear(self):
+        clave_admin = self._inp_admin.text()
+        clave_vendedor = self._inp_vendedor.text()
+
+        if not clave_admin.strip() or not clave_vendedor.strip():
+            QMessageBox.warning(self, "Faltan contraseñas",
+                                "Escribe y confirma las dos contraseñas.")
+            return
+        if clave_admin != self._inp_admin2.text():
+            QMessageBox.warning(self, "No coincide",
+                                "La contraseña de admin y su confirmación "
+                                "no coinciden.")
+            return
+        if clave_vendedor != self._inp_vendedor2.text():
+            QMessageBox.warning(self, "No coincide",
+                                "La contraseña de vendedor y su confirmación "
+                                "no coinciden.")
+            return
+        if clave_admin == clave_vendedor:
+            QMessageBox.warning(self, "Claves iguales",
+                                "La clave de admin y la de vendedor deben "
+                                "ser diferentes (la de admin abre TODO).")
+            return
+
+        try:
+            with conectar() as conn:
+                crear_usuario(conn, "admin", "Administrador", "admin",
+                              clave_admin)
+                crear_usuario(conn, "vendedor", "Perfil de ventas",
+                              "vendedor", clave_vendedor)
+        except sqlite3.Error as e:
+            QMessageBox.warning(self, "No se pudo crear", mensaje_error_db(e))
+            return
+
+        QMessageBox.information(
+            self, "Cuentas creadas",
+            "Listo. Entra como «admin» para administrar la tienda o como "
+            "«vendedor» para la caja."
+        )
         self.accept()
 
 
@@ -3285,23 +3365,6 @@ def pedir_usuario_y_fondo(parent=None):
     login = DialogoLogin(parent)
     if login.exec() != QDialog.Accepted:
         return None, None
-
-    # Clave por defecto: INVITAR a cambiarla, sin bloquear el paso
-    # (decisión del dueño 2026-07-10: el personal ya se las aprendió).
-    if login.usuario_actual.get("password_por_defecto"):
-        r = QMessageBox.question(
-            parent, "Contraseña por defecto",
-            "Estás entrando con una clave por defecto del sistema.\n"
-            "Puedes seguir usándola, pero es más seguro ponerte una propia.\n\n"
-            "¿Quieres cambiarla ahora? (También puedes hacerlo después\n"
-            "con el botón «🔑 Contraseña» de la barra inferior.)",
-            QMessageBox.Yes | QMessageBox.No,
-        )
-        if r == QMessageBox.Yes:
-            cambio = DialogoCambioContrasena(
-                login.usuario_actual, modo="sugerido", parent=parent)
-            if cambio.exec() == QDialog.Accepted:
-                login.usuario_actual["password_por_defecto"] = False
 
     if login.usuario_actual["rol"] == "vendedor":
         nombre_turno = DialogoNombreVendedor(login.usuario_actual, parent)
@@ -8312,6 +8375,12 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setStyleSheet(ESTILO)
+
+    # BD nueva sin usuarios: el dueño crea sus cuentas con SUS claves
+    if not hay_usuarios_activos():
+        primer_uso = DialogoPrimerUsuario()
+        if primer_uso.exec() != QDialog.Accepted:
+            sys.exit(0)
 
     usuario_actual, fondo_inicial = pedir_usuario_y_fondo()
     if not usuario_actual:
